@@ -2,40 +2,41 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import math
-import ast # For safely evaluating list inputs
+import ast
+from copy import deepcopy # To compare dataframes without modifying originals
 
 # --- Constants ---
-INR_TO_USD = 85.0  # Use float for division
+INR_TO_USD = 85.0
 
 # --- Helper Functions ---
 
 def format_currency(amount, currency):
     """Formats currency values with mn/bn suffixes based on selected currency."""
+    display_amount = amount
     if currency == 'USD':
-        amount /= INR_TO_USD
-    
-    abs_amount = abs(amount)
-    sign = "-" if amount < 0 else ""
+        display_amount /= INR_TO_USD
+
+    abs_amount = abs(display_amount)
+    sign = "-" if display_amount < 0 else ""
 
     if abs_amount >= 1e9:
         return f"{sign}{(abs_amount / 1e9):.1f} bn"
     elif abs_amount >= 1e6:
         return f"{sign}{(abs_amount / 1e6):.1f} mn"
     else:
-        # Use f-string formatting for consistent decimal places
-        return f"{sign}{amount:,.2f}" 
+        # Format with commas and 2 decimal places
+        return f"{sign}{display_amount:,.2f}"
 
 def format_units(units):
     """Formats unit counts with mn/bn suffixes."""
     abs_units = abs(units)
-    sign = "-" if units < 0 else "" # Should not be negative, but good practice
+    sign = "-" if units < 0 else ""
 
     if abs_units >= 1e9:
         return f"{sign}{(abs_units / 1e9):.1f} bn"
     elif abs_units >= 1e6:
         return f"{sign}{(abs_units / 1e6):.1f} mn"
     else:
-        # Format as integer if whole number, else with decimals if needed
         return f"{sign}{int(units):,}" if units == int(units) else f"{sign}{units:,}"
 
 def parse_list_input(input_string, default_value):
@@ -51,210 +52,354 @@ def parse_list_input(input_string, default_value):
         st.warning(f"Could not parse input '{input_string}' as a list. Using default: {default_value}")
         return default_value
 
+# --- Core Calculation Function ---
+def calculate_projections(
+    initial_capital, fixed_costs_initial, variable_cost_per_unit,
+    selling_price_per_unit, profit_growth_rate_input, ci_months, ci_amounts,
+    fixed_cost_growth_rate_input, fixed_cost_cap, diseconomies_of_scale_input,
+    months, user_edits={} # Pass user edits as a dictionary {(month, col): value}
+):
+    """Calculates the financial projections incorporating user overrides."""
+
+    # Convert percentages to decimals
+    profit_growth_rate = profit_growth_rate_input / 100.0
+    fixed_cost_growth_rate = fixed_cost_growth_rate_input / 100.0
+    diseconomies_of_scale = diseconomies_of_scale_input / 100.0
+
+    # Create a dictionary for quick lookup of initial capital injections
+    capital_injection_map = dict(zip(ci_months, ci_amounts))
+
+    data = []
+    starting_capital = initial_capital
+    current_fixed_costs = fixed_costs_initial
+    profit_per_unit_for_margin = selling_price_per_unit - variable_cost_per_unit
+
+    # Validation moved outside loop for efficiency
+    if selling_price_per_unit <= 0:
+         # We need a price to calculate revenue and margin %
+         st.error("Error: Selling Price Per Unit must be positive.")
+         return pd.DataFrame() # Return empty DataFrame on critical error
+
+
+    for month in range(1, months + 1):
+
+        # --- Apply User Edits/Overrides ---
+        # Check if user edited Fixed Costs for this month
+        edited_fixed_costs = user_edits.get((month, "Fixed Costs"))
+        effective_fixed_costs = edited_fixed_costs if edited_fixed_costs is not None else current_fixed_costs
+
+        # Check if user edited Capital Injection for this month
+        initial_capital_injection = capital_injection_map.get(month, 0)
+        edited_capital_injection = user_edits.get((month, "Capital Injection"))
+        effective_capital_injection = edited_capital_injection if edited_capital_injection is not None else initial_capital_injection
+        # --- End Apply User Edits ---
+
+
+        # 1. Calculate funds available after fixed costs (using effective costs)
+        remaining_for_production = starting_capital - effective_fixed_costs
+
+        # 2. Calculate units produced
+        units_produced = 0
+        if remaining_for_production > 0 and variable_cost_per_unit > 0:
+            units_produced = math.floor(remaining_for_production / variable_cost_per_unit)
+        elif remaining_for_production > 0 and variable_cost_per_unit <= 0: # Handle zero/negative VC
+             units_produced = 0 # Avoid infinite production / division issues
+             # Could add a warning if desired
+
+        # 3. Calculate Revenue
+        revenue = units_produced * selling_price_per_unit
+
+        # 4. Calculate Diseconomies Cost
+        diseconomies_cost = revenue * diseconomies_of_scale
+
+        # 5. Calculate Profit (JS Logic)
+        profit_js_logic = revenue - (remaining_for_production + effective_fixed_costs + diseconomies_cost)
+
+        # Calculate Standard Profit (for potential display/analysis)
+        variable_costs_total = units_produced * variable_cost_per_unit
+        profit_standard = revenue - effective_fixed_costs - variable_costs_total - diseconomies_cost
+        profit_for_month = profit_js_logic # Use JS logic for ending capital
+
+        # 6. Calculate Profit Margin Percentage
+        profit_margin_percentage = 0.0
+        if selling_price_per_unit != 0:
+            profit_margin_percentage = (profit_per_unit_for_margin / selling_price_per_unit) * 100
+
+        # 7. Capital Injection is now effective_capital_injection
+
+        # 8. Calculate Ending Capital
+        ending_capital = starting_capital + profit_for_month + effective_capital_injection
+
+        # Store results for this month
+        month_data = {
+            "Month": month,
+            "Starting Capital": starting_capital,
+            "Fixed Costs": effective_fixed_costs, # Store the potentially edited value
+            "Remaining for Prod.": max(0, remaining_for_production), # Show 0 if negative
+            "Units Produced": units_produced,
+            "Revenue": revenue,
+            "Profit Margin (%)": profit_margin_percentage,
+            "Profit (JS Logic)": profit_for_month,
+            "Profit (Standard)": profit_standard,
+            "Diseconomies Cost": diseconomies_cost,
+            "Capital Injection": effective_capital_injection, # Store the potentially edited value
+            "Ending Capital": ending_capital,
+        }
+        data.append(month_data)
+
+        # --- Update for Next Month ---
+        starting_capital = ending_capital
+        # Base next month's fixed costs on the *previous calculated or edited* value
+        prev_fixed_costs = effective_fixed_costs
+        current_fixed_costs = min(prev_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
+        # Update the theoretical profit per unit for margin display
+        profit_per_unit_for_margin *= (1 + profit_growth_rate)
+
+    return pd.DataFrame(data)
+
 # --- Streamlit App Layout ---
 
-st.set_page_config(layout="wide") # Use wide layout for better table/chart display
-st.title("Financial Projection Tool")
+st.set_page_config(layout="wide")
+st.title("Financial Projection Tool (Editable)")
+
+# --- Initialize Session State ---
+if 'df_results' not in st.session_state:
+    st.session_state.df_results = pd.DataFrame() # Holds the main data
+if 'user_edits' not in st.session_state:
+    st.session_state.user_edits = {} # Holds {(month, col): value} overrides
+if 'last_data_editor_state' not in st.session_state:
+     st.session_state.last_data_editor_state = {} # To detect changes in data_editor
+
 
 # --- Input Form ---
-# Use columns for side-by-side layout similar to the original
-col1, col2 = st.columns(2)
-
-with col1:
-    st.header("Business Parameters")
+with st.sidebar: # Move inputs to sidebar for more space
+    st.header("Initial Parameters")
     initial_capital = st.number_input("Initial Capital (₹):", min_value=0.0, value=200000000.0, step=1000000.0, format="%.2f")
     fixed_costs_initial = st.number_input("Initial Fixed Costs (₹):", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
     variable_cost_per_unit = st.number_input("Variable Cost Per Unit (₹):", min_value=0.0, value=13.0, step=0.5, format="%.2f")
     selling_price_per_unit = st.number_input("Selling Price Per Unit (₹):", min_value=0.0, value=18.0, step=0.5, format="%.2f")
-    # Note: Original JS applies this to the theoretical profit per unit for margin display, not the core profit calc. Replicating that.
     profit_growth_rate_input = st.number_input("Profit Growth Rate (% per month):", value=-1.0, step=0.1, format="%.2f", help="Affects the theoretical 'Profit Margin (%)' display calculation month-over-month.")
-    
-    ci_months_str = st.text_input("Capital Injection Months (e.g., [9,18,27]):", value="[9,18,27]")
-    ci_amounts_str = st.text_input("Capital Injection Amounts (₹) (e.g., [200000000,200000000,-99999]):", value="[200000000,200000000,-99999]")
-
-with col2:
-    st.header("Growth & Constraints")
     fixed_cost_growth_rate_input = st.number_input("Fixed Cost Growth Rate (% per month):", value=100.0, step=1.0, format="%.2f")
     fixed_cost_cap = st.number_input("Fixed Cost Cap (₹):", min_value=0.0, value=999999999.0, step=10000.0, format="%.2f")
     diseconomies_of_scale_input = st.number_input("Diseconomies of Scale (% of Revenue):", min_value=0.0, value=0.5, step=0.1, format="%.2f")
     months = st.number_input("Number of Months:", min_value=1, value=36, step=1)
 
-# --- Currency Toggle ---
-st.markdown("---") # Separator
-current_currency = st.radio("Display Currency:", ("INR", "USD"), index=0, horizontal=True)
-st.markdown("---")
+    st.header("Capital Injections")
+    ci_months_str = st.text_input("Injection Months (e.g., [9,18,27]):", value="[9,18,27]")
+    ci_amounts_str = st.text_input("Injection Amounts (₹) (e.g., [200M,200M,-99k]):", value="[200000000,200000000,-99999]")
 
-# --- Input Validation and Parsing ---
-# Convert percentages to decimals
-profit_growth_rate = profit_growth_rate_input / 100.0
-fixed_cost_growth_rate = fixed_cost_growth_rate_input / 100.0
-diseconomies_of_scale = diseconomies_of_scale_input / 100.0
+    # --- Actions ---
+    col1, col2 = st.columns(2)
+    generate_button = col1.button("Generate Projections", type="primary", use_container_width=True)
+    clear_edits_button = col2.button("Clear Edits & Recalculate", use_container_width=True)
 
+    # --- Currency Toggle ---
+    st.header("Display")
+    current_currency = st.radio("Currency:", ("INR", "USD"), index=0, horizontal=True)
+
+
+# --- Parse Inputs & Handle Actions ---
 # Parse list inputs safely
 ci_months = parse_list_input(ci_months_str, [9, 18, 27])
 ci_amounts = parse_list_input(ci_amounts_str, [200000000, 200000000, -99999])
 
 # Validate list lengths
+valid_inputs = True
 if len(ci_months) != len(ci_amounts):
-    st.error("Error: The number of 'Capital Injection Months' must match the number of 'Capital Injection Amounts'. Please check your inputs.")
-    st.stop() # Halt execution if lists don't match
+    st.sidebar.error("Error: Injection months and amounts lists must have the same length.")
+    valid_inputs = False
+    st.stop() # Prevent calculation with mismatched lists
 
-# Create a dictionary for quick lookup of capital injections
-capital_injection_map = dict(zip(ci_months, ci_amounts))
+# Generate Projections Button Clicked
+if generate_button and valid_inputs:
+    st.session_state.user_edits = {} # Clear previous edits when generating anew
+    st.session_state.df_results = calculate_projections(
+        initial_capital, fixed_costs_initial, variable_cost_per_unit,
+        selling_price_per_unit, profit_growth_rate_input, ci_months, ci_amounts,
+        fixed_cost_growth_rate_input, fixed_cost_cap, diseconomies_of_scale_input,
+        months, user_edits={} # Start fresh
+    )
+    st.session_state.last_data_editor_state = {} # Reset editor state tracking
+    st.rerun() # Rerun to update the display immediately after calculation
 
-# --- Core Calculation Logic ---
-if variable_cost_per_unit >= selling_price_per_unit and profit_growth_rate <= 0:
-     st.warning("Warning: Selling Price per Unit is not greater than Variable Cost Per Unit, and Profit Growth Rate is not positive. Profitability may not be achieved.")
-elif variable_cost_per_unit >= selling_price_per_unit :
-     st.warning("Warning: Selling Price per Unit is not greater than Variable Cost Per Unit.")
-
-
-data = []
-starting_capital = initial_capital
-current_fixed_costs = fixed_costs_initial
-# Initial profit per unit for margin calculation (this value changes based on profit_growth_rate)
-profit_per_unit_for_margin = selling_price_per_unit - variable_cost_per_unit
-
-# Check for division by zero if selling price is zero
-if selling_price_per_unit == 0:
-    st.error("Error: Selling Price Per Unit cannot be zero.")
-    st.stop()
-
-for month in range(1, months + 1):
-    # 1. Calculate funds available after fixed costs
-    remaining_for_production = starting_capital - current_fixed_costs
-
-    # 2. Calculate units produced (avoid division by zero, handle negative remaining funds)
-    units_produced = 0
-    if remaining_for_production > 0 and variable_cost_per_unit > 0:
-        units_produced = math.floor(remaining_for_production / variable_cost_per_unit)
-    elif remaining_for_production > 0 and variable_cost_per_unit == 0:
-         # If variable cost is zero, can theoretically produce infinite units
-         # Handle this case based on desired business logic. Assume 0 for now to avoid infinity.
-         # Or potentially set a max production capacity if that input existed.
-         # For safety and matching JS where this wasn't explicitly handled:
-         units_produced = 0 # Or perhaps calculate based on revenue potential vs remaining capital? Reverting to 0 if VC=0.
-         st.warning(f"Month {month}: Variable cost is zero, setting units produced to 0.")
+# Clear Edits Button Clicked
+if clear_edits_button and valid_inputs:
+    if st.session_state.user_edits: # Only recalculate if there were edits to clear
+        st.session_state.user_edits = {}
+        st.session_state.df_results = calculate_projections(
+            initial_capital, fixed_costs_initial, variable_cost_per_unit,
+            selling_price_per_unit, profit_growth_rate_input, ci_months, ci_amounts,
+            fixed_cost_growth_rate_input, fixed_cost_cap, diseconomies_of_scale_input,
+            months, user_edits={} # Recalculate without edits
+        )
+        st.session_state.last_data_editor_state = {} # Reset editor state tracking
+        st.sidebar.success("Edits cleared and projections recalculated.")
+        st.rerun()
+    else:
+        st.sidebar.info("No user edits to clear.")
 
 
-    # 3. Calculate Revenue
-    revenue = units_produced * selling_price_per_unit
+# --- Display Results ---
+if not st.session_state.df_results.empty:
 
-    # 4. Calculate Diseconomies Cost
-    diseconomies_cost = revenue * diseconomies_of_scale
+    st.header("Editable Projections Table")
+    st.caption("You can edit cells in the 'Fixed Costs' and 'Capital Injection' columns. Changes will recalculate subsequent months.")
 
-    # 5. Calculate Profit (using the EXACT logic from the original JS)
-    # Original JS Profit = revenue - (remainingForProduction + currentFixedCosts + diseconomiesCost)
-    # Which simplifies to: revenue - startingCapital - diseconomiesCost
-    # *** NOTE: This differs from standard accounting profit: Revenue - FixedCosts - VariableCosts - DiseconomiesCost ***
-    # To replicate the JS exactly:
-    profit_js_logic = revenue - (remaining_for_production + current_fixed_costs + diseconomies_cost)
-    # Let's also calculate standard profit for comparison/potential future use
-    variable_costs_total = units_produced * variable_cost_per_unit
-    profit_standard = revenue - current_fixed_costs - variable_costs_total - diseconomies_cost
-    
-    # Using the JS logic profit for ending capital calculation as per original code:
-    profit_for_month = profit_js_logic
+    # Prepare dataframe for editing (use raw numbers)
+    df_editable = st.session_state.df_results.copy()
 
-    # 6. Calculate Profit Margin Percentage (based on the evolving profit_per_unit_for_margin)
-    # Avoid division by zero if selling_price_per_unit becomes zero (shouldn't happen with input validation but safe)
-    profit_margin_percentage = 0.0
-    if selling_price_per_unit != 0:
-       # Profit margin uses the theoretical profit per unit, which grows/shrinks
-       profit_margin_percentage = (profit_per_unit_for_margin / selling_price_per_unit) * 100
-
-
-    # 7. Check for Capital Injection
-    capital_injection = capital_injection_map.get(month, 0) # Get injection amount or 0 if month not in map
-
-    # 8. Calculate Ending Capital
-    ending_capital = starting_capital + profit_for_month + capital_injection
-
-    # Store results for this month
-    month_data = {
-        "Month": month,
-        "Starting Capital": starting_capital,
-        "Fixed Costs": current_fixed_costs,
-        "Remaining for Prod.": remaining_for_production if remaining_for_production > 0 else 0, # Show 0 if negative
-        "Units Produced": units_produced,
-        "Revenue": revenue,
-        "Profit Margin (%)": profit_margin_percentage, # Theoretical margin based on per-unit price/cost
-        "Profit (JS Logic)": profit_for_month, # Profit calculated as per original JS
-        "Profit (Standard)": profit_standard, # Standard accounting profit
-        "Diseconomies Cost": diseconomies_cost,
-        "Capital Injection": capital_injection,
-        "Ending Capital": ending_capital,
-    }
-    data.append(month_data)
-
-    # --- Update for Next Month ---
-    starting_capital = ending_capital
-    current_fixed_costs = min(current_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
-    # Update the theoretical profit per unit used for margin display
-    profit_per_unit_for_margin *= (1 + profit_growth_rate)
-    # Selling price per unit remains constant in the original logic unless profit_per_unit logic implicitly changes it.
-    # Based on JS, selling_price_per_unit is static input. profit_per_unit calculation affects ONLY the margin display.
+    # Define which columns are editable
+    # Make all columns read-only by default
+    column_config = {col: st.column_config.NumberColumn(disabled=True, format="%.2f") for col in df_editable.columns if col != "Month"}
+    # Specifically enable editing for Fixed Costs and Capital Injection
+    column_config["Fixed Costs"] = st.column_config.NumberColumn(
+        label="Fixed Costs (Editable)", # Custom label
+        min_value=0, # Example validation: Fixed costs cannot be negative
+        format="%.2f", # Ensure proper formatting display in edit mode
+        disabled=False
+        )
+    column_config["Capital Injection"] = st.column_config.NumberColumn(
+        label="Capital Injection (Editable)",
+        format="%.2f",
+        disabled=False
+        )
+    # Configure Month column separately if needed (usually just displayed)
+    column_config["Month"] = st.column_config.NumberColumn(disabled=True)
+    # Configure other specific formatting if needed
+    column_config["Units Produced"] = st.column_config.NumberColumn(disabled=True, format="%d") # Integer format
+    column_config["Profit Margin (%)"] = st.column_config.NumberColumn(disabled=True, format="%.2f%%")
 
 
-# --- Create DataFrame ---
-df = pd.DataFrame(data)
+    # Store the state of the dataframe *before* showing the editor
+    df_before_edit = df_editable.copy()
 
-# --- Display Table ---
-st.header("Financial Projections Table")
+    # Display the data editor
+    edited_df = st.data_editor(
+        df_editable,
+        column_config=column_config,
+        key="data_editor", # Assign a key to persist editor state correctly
+        hide_index=True,
+        num_rows="dynamic", # Allows adding/deleting rows, maybe disable if not desired: use "fixed"
+        use_container_width=True
+    )
 
-# Create a copy for display formatting
-df_display = df.copy()
+    # --- Detect and Process Edits ---
+    # Check if the dataframe returned by the editor is different from the one fed into it
+    if not edited_df.equals(df_before_edit):
+        # Find changes (more robust comparison needed for production)
+        # This is a simple diff; more complex logic might be needed for row add/delete
+        try:
+            diff = edited_df.compare(df_before_edit)
+            new_edits_detected = False
+            for idx in diff.index:
+                month = edited_df.loc[idx, "Month"] # Get the month for the changed row
+                changed_cols = diff.loc[idx].dropna().index.get_level_values(0).unique()
 
-# Apply formatting based on selected currency
-currency_symbol = "₹" if current_currency == "INR" else "$"
-amount_cols = ["Starting Capital", "Fixed Costs", "Remaining for Prod.", "Revenue",
-               "Profit (JS Logic)", "Profit (Standard)", "Diseconomies Cost", "Capital Injection", "Ending Capital"]
-
-for col in amount_cols:
-    df_display[col] = df[col].apply(lambda x: f"{currency_symbol}{format_currency(x, current_currency)}")
-
-df_display["Units Produced"] = df["Units Produced"].apply(format_units)
-df_display["Profit Margin (%)"] = df["Profit Margin (%)"].apply(lambda x: f"{x:.2f}%")
-
-# Select columns to display (including the standard profit for info)
-display_cols = ["Month", "Starting Capital", "Fixed Costs", "Remaining for Prod.",
-                "Units Produced", "Revenue", "Profit Margin (%)", "Profit (JS Logic)", "Profit (Standard)",
-                "Diseconomies Cost", "Capital Injection", "Ending Capital"]
-st.dataframe(df_display[display_cols], hide_index=True) # Use st.dataframe for better interactivity
+                for col in changed_cols:
+                    # Only process edits in allowed columns
+                    if col in ["Fixed Costs", "Capital Injection"]:
+                        new_value = edited_df.loc[idx, col]
+                        # Basic Validation (Example: ensure non-negative Fixed Costs)
+                        if col == "Fixed Costs" and new_value < 0:
+                            st.warning(f"Invalid Edit: Fixed Costs for Month {month} cannot be negative. Reverting change.")
+                            # Revert the change in the edited_df before recalculating
+                            # This part is tricky with data_editor's direct modification.
+                            # A cleaner way is to ignore the invalid edit when updating user_edits
+                            continue # Skip this invalid edit
 
 
-# --- Display Chart ---
-st.header("Financial Projections Chart")
+                        # Check if this specific edit is actually new or different
+                        edit_key = (month, col)
+                        if edit_key not in st.session_state.user_edits or st.session_state.user_edits[edit_key] != new_value:
+                            st.session_state.user_edits[edit_key] = new_value
+                            new_edits_detected = True
+                            # st.toast(f"Change detected: Month {month}, {col} = {new_value}") # Optional feedback
 
-# Prepare data for chart (apply currency conversion if needed)
-chart_df = df.copy()
-if current_currency == 'USD':
-    for col in amount_cols:
-        chart_df[col] = chart_df[col] / INR_TO_USD
+            # If any valid new edit was detected, recalculate
+            if new_edits_detected and valid_inputs:
+                 st.session_state.df_results = calculate_projections(
+                    initial_capital, fixed_costs_initial, variable_cost_per_unit,
+                    selling_price_per_unit, profit_growth_rate_input, ci_months, ci_amounts,
+                    fixed_cost_growth_rate_input, fixed_cost_cap, diseconomies_of_scale_input,
+                    months, st.session_state.user_edits # Pass current edits
+                )
+                 st.rerun() # Rerun immediately to show recalculated data in editor/chart
 
-fig = go.Figure()
+        except Exception as e:
+            st.error(f"Error processing edits: {e}")
+            # Potentially reset or handle error state
 
-# Add traces for key metrics
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Starting Capital"], mode='lines', name='Starting Capital'))
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Fixed Costs"], mode='lines', name='Fixed Costs'))
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Revenue"], mode='lines', name='Revenue'))
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Profit (JS Logic)"], mode='lines', name='Profit (JS Logic)', line=dict(dash='dot'))) # Use JS profit for main chart line as per original
-# fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Profit (Standard)"], mode='lines', name='Profit (Standard)', line=dict(dash='dash'))) # Optional: show standard profit too
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Diseconomies Cost"], mode='lines', name='Diseconomies Cost'))
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Capital Injection"], mode='lines', name='Capital Injection'))
-fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Ending Capital"], mode='lines', name='Ending Capital', line=dict(width=3))) # Thicker line for emphasis
 
-# Update layout
-fig.update_layout(
-    title="Monthly Financial Trends",
-    xaxis_title="Month",
-    yaxis_title=f"Amount ({current_currency})",
-    legend_title="Metrics",
-    hovermode="x unified" # Improves tooltip display
-)
+    # --- Display Formatted Table (Read-Only) ---
+    st.header("Formatted Projections (Read-Only)")
+    df_display = st.session_state.df_results.copy()
+    currency_symbol = "₹" if current_currency == "INR" else "$"
+    amount_cols_display = ["Starting Capital", "Fixed Costs", "Remaining for Prod.", "Revenue",
+                           "Profit (JS Logic)", "Profit (Standard)", "Diseconomies Cost", "Capital Injection", "Ending Capital"]
 
-st.plotly_chart(fig, use_container_width=True)
+    for col in amount_cols_display:
+         # Ensure column exists before formatting
+         if col in df_display.columns:
+              df_display[col] = st.session_state.df_results[col].apply(lambda x: f"{currency_symbol}{format_currency(x, current_currency)}")
 
-# --- Optional: Display Raw Data ---
-# with st.expander("Show Raw Calculated Data (INR)"):
-#     st.dataframe(df)
+    if "Units Produced" in df_display.columns:
+        df_display["Units Produced"] = st.session_state.df_results["Units Produced"].apply(format_units)
+    if "Profit Margin (%)" in df_display.columns:
+        df_display["Profit Margin (%)"] = st.session_state.df_results["Profit Margin (%)"].apply(lambda x: f"{x:.2f}%")
+
+    # Select and order columns for display
+    display_cols_order = ["Month", "Starting Capital", "Fixed Costs", "Remaining for Prod.",
+                          "Units Produced", "Revenue", "Profit Margin (%)", "Profit (JS Logic)", #"Profit (Standard)",
+                          "Diseconomies Cost", "Capital Injection", "Ending Capital"]
+    # Filter out columns that might not exist if calculation failed
+    display_cols_final = [col for col in display_cols_order if col in df_display.columns]
+    st.dataframe(df_display[display_cols_final], hide_index=True, use_container_width=True)
+
+
+    # --- Display Chart ---
+    st.header("Financial Projections Chart")
+    chart_df = st.session_state.df_results.copy() # Use the latest calculated data
+
+    # Prepare data for chart (apply currency conversion if needed)
+    if current_currency == 'USD':
+        amount_cols_chart = ["Starting Capital", "Fixed Costs", "Remaining for Prod.", "Revenue",
+                             "Profit (JS Logic)", "Profit (Standard)", "Diseconomies Cost",
+                             "Capital Injection", "Ending Capital"]
+        for col in amount_cols_chart:
+             if col in chart_df.columns:
+                chart_df[col] = chart_df[col] / INR_TO_USD
+
+    fig = go.Figure()
+    # Add traces only if columns exist
+    if "Starting Capital" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Starting Capital"], mode='lines', name='Starting Capital'))
+    if "Fixed Costs" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Fixed Costs"], mode='lines', name='Fixed Costs'))
+    # ... (add similar checks for other columns) ...
+    if "Revenue" in chart_df.columns:
+      fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Revenue"], mode='lines', name='Revenue'))
+    if "Profit (JS Logic)" in chart_df.columns:
+      fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Profit (JS Logic)"], mode='lines', name='Profit (JS Logic)', line=dict(dash='dot')))
+    if "Diseconomies Cost" in chart_df.columns:
+      fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Diseconomies Cost"], mode='lines', name='Diseconomies Cost'))
+    if "Capital Injection" in chart_df.columns:
+      fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Capital Injection"], mode='lines', name='Capital Injection'))
+    if "Ending Capital" in chart_df.columns:
+      fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Ending Capital"], mode='lines', name='Ending Capital', line=dict(width=3)))
+
+
+    fig.update_layout(
+        title="Monthly Financial Trends",
+        xaxis_title="Month",
+        yaxis_title=f"Amount ({current_currency})",
+        legend_title="Metrics",
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Click 'Generate Projections' in the sidebar to start.")
+
+# --- Optional: Display Raw Edits ---
+# with st.expander("Show User Edits"):
+#     st.write(st.session_state.user_edits)
