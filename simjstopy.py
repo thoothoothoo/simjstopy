@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px # For simpler summary charts
+import plotly.express as px
 import math
 import ast
 from copy import deepcopy
@@ -27,7 +27,16 @@ def format_currency_display(amount, currency):
     symbol = "₹" if currency == "INR" else "$"
     if currency == 'USD':
         if INR_TO_USD == 0: return f"{symbol}NaN"
-        display_amount /= INR_TO_USD
+        # Prevent division by zero errors with large numbers if INR_TO_USD is invalid
+        try:
+            display_amount /= INR_TO_USD
+        except (TypeError, ZeroDivisionError):
+             return f"{symbol}NaN"
+
+
+    # Handle potential non-numeric input gracefully
+    if not isinstance(display_amount, (int, float)):
+        return f"{symbol}Invalid"
 
     abs_amount = abs(display_amount)
     sign = "-" if display_amount < 0 else ""
@@ -36,20 +45,19 @@ def format_currency_display(amount, currency):
         val_str = f"{sign}{(abs_amount / 1e9):.1f} bn"
     elif abs_amount >= 1e6:
         val_str = f"{sign}{(abs_amount / 1e6):.1f} mn"
+    elif abs_amount >= 1e3: # Add k for thousands
+        val_str = f"{sign}{(abs_amount / 1e3):.1f} k"
     else:
-        val_str = f"{sign}{display_amount:,.2f}"
+        val_str = f"{sign}{display_amount:,.2f}" # Keep decimals for smaller numbers
     return f"{symbol}{val_str}"
 
-def format_currency_editor(currency):
-    """Returns the format string for the data_editor."""
-    symbol = "₹" if currency == "INR" else "$"
-    # Format with symbol and commas, 2 decimal places. Editing might be slightly tricky.
-    return f"{symbol}#,##0.00"
-
+# Removed format_currency_editor as complex formats didn't work. Use std formats.
 
 def format_units(units):
-    """Formats unit counts with mn/bn suffixes."""
-    # (Same as before)
+    """Formats unit counts with mn/bn/k suffixes."""
+    if not isinstance(units, (int, float)):
+        return "Invalid"
+
     abs_units = abs(units)
     sign = "-" if units < 0 else ""
 
@@ -57,9 +65,10 @@ def format_units(units):
         return f"{sign}{(abs_units / 1e9):.1f} bn"
     elif abs_units >= 1e6:
         return f"{sign}{(abs_units / 1e6):.1f} mn"
+    elif abs_units >= 1e3: # Add k for thousands
+        return f"{sign}{(abs_units / 1e3):.1f} k"
     else:
-        # Format as integer
-        return f"{sign}{int(units):,}"
+        return f"{sign}{int(units):,}" if units == int(units) else f"{sign}{units:,.0f}" # No decimals for units
 
 def parse_list_input(input_string, default_value):
     """Safely parses a string input expected to be a list."""
@@ -76,6 +85,7 @@ def parse_list_input(input_string, default_value):
         return default_value
 
 # --- Core Calculation Function ---
+# (calculate_projections remains largely the same logic as previous version)
 def calculate_projections(
     initial_capital, fixed_costs_initial, variable_cost_per_unit,
     selling_price_per_unit_initial, sales_percentage, ci_months, ci_amounts,
@@ -99,7 +109,6 @@ def calculate_projections(
     # Validation
     if variable_cost_per_unit < 0:
         st.warning("Warning: Variable Cost Per Unit is negative.")
-    # Selling price is handled per month now
 
     for month in range(1, months + 1):
 
@@ -115,10 +124,9 @@ def calculate_projections(
         effective_selling_price = edited_selling_price if edited_selling_price is not None else selling_price_per_unit_initial
 
         if effective_selling_price <= 0:
-             st.warning(f"Month {month}: Effective Selling Price is zero or negative. Revenue will be zero.")
+             #st.warning(f"Month {month}: Effective Selling Price is zero or negative. Revenue will be zero.")
              effective_selling_price = 0 # Prevent downstream errors
         # --- End Apply User Edits ---
-
 
         # 1. Funds available (after fixed costs)
         remaining_for_production = starting_capital - effective_fixed_costs
@@ -126,7 +134,11 @@ def calculate_projections(
         # 2. Units Produced
         units_produced = 0
         if remaining_for_production > 0 and variable_cost_per_unit > 0:
-            units_produced = math.floor(remaining_for_production / variable_cost_per_unit)
+             try: # Avoid overflow potential with huge numbers
+                 units_produced = math.floor(remaining_for_production / variable_cost_per_unit)
+             except OverflowError:
+                 units_produced = 0 # Or some indicator of max capacity reached
+                 st.warning(f"Month {month}: Potential overflow calculating units produced. Setting to 0.")
         elif remaining_for_production > 0 and variable_cost_per_unit <= 0:
              units_produced = 0 # Avoid infinite/undefined production
 
@@ -145,11 +157,11 @@ def calculate_projections(
         diseconomies_cost = revenue * diseconomies_of_scale
 
         # 7. Profit Calculation (Standard Accounting)
-        gross_profit = revenue - (units_sold * variable_cost_per_unit) # Revenue minus COGS for units sold
-        # Let's use a simpler Operating Profit for now: Rev - FC - VC_produced - Diseconomies
-        # This assumes VC is expensed when produced, common in simple models
-        operating_profit = revenue - effective_fixed_costs - variable_costs_total - diseconomies_cost
-        # For cash flow, we use this operating profit
+        # Gross Profit based on COGS = units_sold * variable_cost_per_unit
+        cogs = units_sold * variable_cost_per_unit
+        gross_profit = revenue - cogs
+        operating_profit = gross_profit - effective_fixed_costs - diseconomies_cost
+
 
         # 8. Profit Margin (based on effective price)
         profit_margin_percentage = 0.0
@@ -159,11 +171,12 @@ def calculate_projections(
 
         # 9. Ending Capital (Cash Balance)
         # Cash flow: StartCash + Revenue - FixedCosts - VariableCosts_Produced - Diseconomies + Injection
+        # **Correction**: VC cash outflow happens when units are *produced*
         ending_capital = (
             starting_capital
             + revenue
             - effective_fixed_costs
-            - variable_costs_total # Cash out for production
+            - variable_costs_total # Cash out for production costs this month
             - diseconomies_cost
             + effective_capital_injection
         )
@@ -178,7 +191,7 @@ def calculate_projections(
             "Fixed Costs": effective_fixed_costs,
             "Remaining for Prod.": max(0, remaining_for_production),
             "Units Produced": units_produced,
-            "Variable Costs": variable_costs_total, # Cost of production
+            "Variable Costs": variable_costs_total, # Cost of production incurred
             "Inventory Units Start": inventory_units,
             "Units Available": units_available_for_sale,
             "Units Sold": units_sold,
@@ -186,9 +199,9 @@ def calculate_projections(
             "Inventory Value": inventory_value, # Asset value
             "Selling Price Per Unit": effective_selling_price, # Price used
             "Revenue": revenue,
-            # "Gross Profit": gross_profit, # Optional: based on COGS sold
+            "Gross Profit": gross_profit, # Rev - COGS
             "Diseconomies Cost": diseconomies_cost,
-            "Operating Profit": operating_profit, # Simpler profit metric
+            "Operating Profit": operating_profit, # GP - FC - Diseconomies
             "Profit Margin (%)": profit_margin_percentage, # Based on unit economics
             "Capital Injection": effective_capital_injection,
             "Ending Capital": ending_capital, # Cash at end
@@ -200,101 +213,122 @@ def calculate_projections(
         inventory_units = ending_inventory # Ending inventory becomes starting inventory
 
         # Update Fixed Costs (only if not overridden this month)
-        if edited_fixed_costs is None: # Apply growth only if not manually set
-             if current_fixed_costs < fixed_cost_cap :
-                 current_fixed_costs = min(current_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
-             else:
-                 current_fixed_costs = fixed_cost_cap
-        else: # If manually set, that becomes the base for next month's *potential* growth
-             current_fixed_costs = effective_fixed_costs
-             # Apply growth for next calculation cycle if cap not reached
-             if current_fixed_costs < fixed_cost_cap :
-                 current_fixed_costs = min(current_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
-             else:
-                 current_fixed_costs = fixed_cost_cap
+        # Apply growth rate based on the fixed cost actually used this month
+        base_fc_for_next_month = effective_fixed_costs
+        if base_fc_for_next_month < fixed_cost_cap :
+            current_fixed_costs = min(base_fc_for_next_month * (1 + fixed_cost_growth_rate), fixed_cost_cap)
+        else:
+            current_fixed_costs = fixed_cost_cap
 
 
     return pd.DataFrame(data)
+
 
 # --- Aggregation & Summary Functions ---
 
 def generate_summary_tables(df_monthly, period='Quarterly', vc_per_unit=0):
     """Generates P&L, Balance Sheet, Cash Flow summaries."""
+    # *** FIX: Handle empty input DataFrame ***
     if df_monthly.empty:
+        st.warning("No monthly data available to generate summaries.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df = df_monthly.copy()
-    df['Year'] = (df['Month'] - 1) // 12 + 1
-    df['Quarter'] = (df['Month'] - 1) // 3 + 1
+    try: # Wrap in try-except for robustness during aggregation
+        df = df_monthly.copy()
+        df['Year'] = (df['Month'] - 1) // 12 + 1
+        df['Quarter'] = (df['Month'] - 1) // 3 + 1
 
-    group_col = 'Year' if period == 'Annual' else ['Year', 'Quarter']
-    agg_funcs = {
-        # P&L Items (Flows - Sum)
-        'Revenue': 'sum',
-        'Variable Costs': 'sum', # Cost of production in period
-        'Fixed Costs': 'sum',
-        'Diseconomies Cost': 'sum',
-        'Operating Profit': 'sum',
-        'Capital Injection': 'sum',
-        # Balance Sheet Items (Stocks - Last Value)
-        'Ending Capital': 'last', # Cash balance
-        'Inventory Units End': 'last',
-        # Cash Flow Items (Flows - Sum)
-        # Need starting points for CF calculation
-        'Starting Capital': 'first',
-    }
+        group_col = 'Year' if period == 'Annual' else ['Year', 'Quarter']
+        agg_funcs = {
+            # P&L Items (Flows - Sum)
+            'Revenue': 'sum',
+            'Gross Profit': 'sum', # Sum monthly GP
+            'Fixed Costs': 'sum', # Sum monthly FC
+            'Diseconomies Cost': 'sum', # Sum monthly DC
+            'Operating Profit': 'sum', # Sum monthly OP
+            'Capital Injection': 'sum', # Sum injections
+            'Variable Costs': 'sum', # Sum monthly production VC
+            # Balance Sheet Items (Stocks - Last Value)
+            'Ending Capital': 'last', # Cash balance at end of period
+            'Inventory Value': 'last', # Inventory value at end of period
+            # Cash Flow Items
+            'Starting Capital': 'first', # Cash at start of period
+        }
 
-    summary = df.groupby(group_col).agg(agg_funcs).reset_index()
+        # Perform aggregation
+        summary = df.groupby(group_col).agg(agg_funcs).reset_index()
 
-    # --- P&L Summary ---
-    pnl = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year', 'Revenue', 'Variable Costs', 'Fixed Costs', 'Diseconomies Cost', 'Operating Profit']].copy()
-    pnl.rename(columns={'Variable Costs': 'Total Variable Costs', 'Fixed Costs': 'Total Fixed Costs'}, inplace=True)
-    # Add Gross Profit (simple: Rev - Prod Costs)
-    pnl['Gross Profit'] = pnl['Revenue'] - pnl['Total Variable Costs']
-    pnl_cols = ['Year'] + (['Quarter'] if period == 'Quarterly' else []) + ['Revenue', 'Total Variable Costs', 'Gross Profit', 'Total Fixed Costs', 'Diseconomies Cost', 'Operating Profit']
-    pnl = pnl[pnl_cols]
+        # --- P&L Summary ---
+        pnl_cols = ['Revenue', 'Gross Profit', 'Fixed Costs', 'Diseconomies Cost', 'Operating Profit']
+        pnl = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year'] + pnl_cols].copy()
+        pnl.rename(columns={'Fixed Costs': 'Total Fixed Costs'}, inplace=True)
+
+        # --- Balance Sheet Summary (Simplified) ---
+        bs_cols = ['Ending Capital', 'Inventory Value']
+        bs = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year'] + bs_cols].copy()
+        bs.rename(columns={'Ending Capital': 'Cash'}, inplace=True)
+        bs['Total Assets'] = bs['Cash'] + bs['Inventory Value']
+        # Assuming Equity = Assets (no liabilities modeled)
+        bs['Total Equity'] = bs['Total Assets']
+        bs_cols = ['Cash', 'Inventory Value', 'Total Assets', 'Total Equity'] # Reorder for display
+        bs = bs[['Year', 'Quarter' if period == 'Quarterly' else 'Year'] + bs_cols]
+
+        # --- Cash Flow Summary (Simplified) ---
+        cf_cols = ['Starting Capital', 'Ending Capital', 'Operating Profit', 'Capital Injection', 'Variable Costs']
+        cf = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year'] + cf_cols].copy()
+
+        # Cash from Ops = Operating Profit (very simplified - adjust for non-cash & WC changes if needed)
+        # We don't have depreciation. Change in Inventory is a key adjustment needed.
+        # Change in Inventory Value = Ending Inventory Value (from BS) - Starting Inventory Value (need previous period's end)
+        bs['Prev Inventory Value'] = bs['Inventory Value'].shift(1).fillna(0) # Get previous period's ending inventory
+        cf = pd.merge(cf, bs[['Year', 'Quarter' if period == 'Quarterly' else 'Year', 'Inventory Value', 'Prev Inventory Value']], on=['Year', 'Quarter' if period == 'Quarterly' else 'Year'], how='left')
+        cf['Change in Inventory'] = cf['Inventory Value'] - cf['Prev Inventory Value']
+        # Simplified CFO = OP - Change in Inventory (increase in inventory reduces cash)
+        cf['Cash from Operations'] = cf['Operating Profit'] - cf['Change in Inventory']
+
+        cf['Cash from Investing'] = 0 # No investing activities modeled
+        cf['Cash from Financing'] = cf['Capital Injection']
+        cf['Net Change in Cash'] = cf['Cash from Operations'] + cf['Cash from Investing'] + cf['Cash from Financing']
+        # Verification: Net Change should equal Ending Capital - Starting Capital
+        # cf['Verify Net Change'] = cf['Ending Capital'] - cf['Starting Capital']
+
+        cf_cols_final = ['Cash from Operations', 'Cash from Investing', 'Cash from Financing', 'Net Change in Cash', 'Ending Capital']
+        cf = cf[['Year', 'Quarter' if period == 'Quarterly' else 'Year'] + cf_cols_final]
+
+        # --- Add Period Column for Charting ---
+        # *** FIX: Check if DataFrame is empty before adding Period ***
+        if not pnl.empty:
+            if period == 'Quarterly':
+                pnl['Period'] = pnl['Year'].astype(str) + '-Q' + pnl['Quarter'].astype(str)
+                bs['Period'] = bs['Year'].astype(str) + '-Q' + bs['Quarter'].astype(str)
+                cf['Period'] = cf['Year'].astype(str) + '-Q' + cf['Quarter'].astype(str)
+            else:
+                 # Ensure Year column exists before trying to access it
+                if 'Year' in pnl.columns:
+                     pnl['Period'] = pnl['Year'].astype(str)
+                if 'Year' in bs.columns:
+                     bs['Period'] = bs['Year'].astype(str)
+                if 'Year' in cf.columns:
+                     cf['Period'] = cf['Year'].astype(str)
+        else:
+             # If empty, create empty Period column to avoid errors later
+             pnl['Period'] = []
+             bs['Period'] = []
+             cf['Period'] = []
 
 
-    # --- Balance Sheet Summary (Simplified) ---
-    bs = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year', 'Ending Capital', 'Inventory Units End']].copy()
-    bs.rename(columns={'Ending Capital': 'Cash'}, inplace=True)
-    # Value inventory at variable cost
-    bs['Inventory Value'] = bs['Inventory Units End'] * vc_per_unit
-    bs['Total Assets'] = bs['Cash'] + bs['Inventory Value']
-    # Assuming Equity = Assets (no liabilities modeled)
-    bs['Total Equity'] = bs['Total Assets']
-    bs_cols = ['Year'] + (['Quarter'] if period == 'Quarterly' else []) + ['Cash', 'Inventory Value', 'Total Assets', 'Total Equity']
-    bs = bs[bs_cols]
+        return pnl, bs, cf
 
-
-    # --- Cash Flow Summary (Simplified) ---
-    cf = summary[['Year', 'Quarter' if period == 'Quarterly' else 'Year', 'Starting Capital', 'Ending Capital', 'Operating Profit', 'Capital Injection']].copy()
-    # Cash from Ops ~ Operating Profit (needs adjustments for non-cash items like depreciation, changes in working capital - very simplified here)
-    cf['Cash from Operations'] = cf['Operating Profit'] # VERY simplified proxy
-    cf['Cash from Financing'] = cf['Capital Injection']
-    cf['Net Change in Cash'] = cf['Ending Capital'] - cf['Starting Capital'] # More direct calculation
-    # Verify: Net Change ~= CFO + CFF (won't match exactly due to simplification)
-    cf_cols = ['Year'] + (['Quarter'] if period == 'Quarterly' else []) + ['Cash from Operations', 'Cash from Financing', 'Net Change in Cash', 'Ending Capital']
-    cf = cf[cf_cols]
-
-
-    # Add a Period column for charting
-    if period == 'Quarterly':
-        pnl['Period'] = pnl['Year'].astype(str) + '-Q' + pnl['Quarter'].astype(str)
-        bs['Period'] = bs['Year'].astype(str) + '-Q' + bs['Quarter'].astype(str)
-        cf['Period'] = cf['Year'].astype(str) + '-Q' + cf['Quarter'].astype(str)
-    else:
-        pnl['Period'] = pnl['Year'].astype(str)
-        bs['Period'] = bs['Year'].astype(str)
-        cf['Period'] = cf['Year'].astype(str)
-
-    return pnl, bs, cf
+    except Exception as e:
+        st.error(f"Error generating summary tables: {e}")
+        # Return empty dataframes on error
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 
 # --- Streamlit App Layout ---
 
 st.set_page_config(layout="wide")
-st.title("Financial Projection Tool (Advanced)")
+st.title("Financial Projection Tool (Advanced V2)")
 
 # --- Initialize Session State ---
 if 'df_results' not in st.session_state: st.session_state.df_results = pd.DataFrame()
@@ -305,21 +339,21 @@ if 'last_params' not in st.session_state: st.session_state.last_params = {}
 # --- Input Form (Sidebar) ---
 with st.sidebar:
     st.header("Initial Parameters")
-    initial_capital = st.number_input("Initial Capital (₹):", min_value=0.0, value=200000000.0, step=1000000.0, format="%.2f")
-    fixed_costs_initial = st.number_input("Initial Fixed Costs (₹):", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
-    variable_cost_per_unit = st.number_input("Variable Cost Per Unit (₹):", min_value=0.0, value=13.0, step=0.5, format="%.2f") # Keep VC >= 0
-    selling_price_per_unit_initial = st.number_input("Initial Selling Price Per Unit (₹):", min_value=0.01, value=18.0, step=0.5, format="%.2f")
-    sales_percentage = st.number_input("Sales Percentage (% of available units per month):", min_value=0.0, max_value=100.0, value=90.0, step=1.0, format="%.1f")
+    initial_capital = st.number_input("Initial Capital:", min_value=0.0, value=200000000.0, step=1000000.0, format="%.2f")
+    fixed_costs_initial = st.number_input("Initial Fixed Costs:", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
+    variable_cost_per_unit = st.number_input("Variable Cost Per Unit:", min_value=0.0, value=13.0, step=0.5, format="%.2f")
+    selling_price_per_unit_initial = st.number_input("Initial Selling Price Per Unit:", min_value=0.01, value=18.0, step=0.5, format="%.2f")
+    sales_percentage = st.number_input("Sales Percentage (% available/mo):", min_value=0.0, max_value=100.0, value=90.0, step=1.0, format="%.1f")
 
     st.header("Growth & Constraints")
-    fixed_cost_growth_rate_input = st.number_input("Fixed Cost Growth Rate (% per month):", value=100.0, step=1.0, format="%.2f")
-    fixed_cost_cap = st.number_input("Fixed Cost Cap (₹):", min_value=0.0, value=999999999.0, step=10000.0, format="%.2f")
-    diseconomies_of_scale_input = st.number_input("Diseconomies of Scale (% of Revenue):", min_value=0.0, value=0.5, step=0.1, format="%.2f")
+    fixed_cost_growth_rate_input = st.number_input("Fixed Cost Growth Rate (%/mo):", value=100.0, step=1.0, format="%.2f")
+    fixed_cost_cap = st.number_input("Fixed Cost Cap:", min_value=0.0, value=999999999.0, step=10000.0, format="%.2f")
+    diseconomies_of_scale_input = st.number_input("Diseconomies (% of Revenue):", min_value=0.0, value=0.5, step=0.1, format="%.2f")
     months = st.number_input("Number of Months:", min_value=1, value=36, step=1)
 
     st.header("Capital Injections")
     ci_months_str = st.text_input("Injection Months (e.g., [9,18,27]):", value="[9,18,27]")
-    ci_amounts_str = st.text_input("Injection Amounts (₹) (e.g., [200M,200M,-99k]):", value="[200000000,200000000,-99999]")
+    ci_amounts_str = st.text_input("Injection Amounts (e.g., [200M,200M,-99k]):", value="[200000000,200000000,-99999]")
 
     # --- Actions ---
     col1, col2 = st.columns(2)
@@ -328,9 +362,11 @@ with st.sidebar:
 
     # --- Display Currency Toggle ---
     st.header("Display")
-    current_currency = st.radio("Currency:", ("INR", "USD"), index=0, horizontal=True)
+    current_currency = st.radio("Currency:", ("INR", "USD"), index=0, horizontal=True, key="currency_toggle") # Add key
+
 
 # --- Parse Inputs & Handle Actions ---
+# (Input parsing and validation logic remains similar)
 ci_months = parse_list_input(ci_months_str, [9, 18, 27])
 ci_amounts = parse_list_input(ci_amounts_str, [200000000, 200000000, -99999])
 
@@ -340,13 +376,11 @@ if len(ci_months) != len(ci_amounts):
     valid_inputs = False
 if variable_cost_per_unit < 0:
      st.sidebar.warning("Warning: Variable cost is negative.")
-     # Allow proceeding but flag it
 if selling_price_per_unit_initial <= 0:
      st.sidebar.error("Error: Initial Selling Price must be positive.")
      valid_inputs = False
 
-# Store current params for change detection
-current_params = {
+current_params = { # Store params used for calculation
     "ic": initial_capital, "fci": fixed_costs_initial, "vcpu": variable_cost_per_unit,
     "spui": selling_price_per_unit_initial, "sp": sales_percentage, "cim": ci_months, "cia": ci_amounts,
     "fcgr": fixed_cost_growth_rate_input, "fcc": fixed_cost_cap, "dos": diseconomies_of_scale_input,
@@ -354,26 +388,33 @@ current_params = {
 }
 
 # --- Calculation Trigger Logic ---
+# (Remains similar, checks buttons, param changes)
 needs_recalculation = False
+trigger_source = None # For debugging/info
+
 if generate_button:
     st.session_state.user_edits = {}
     needs_recalculation = True
     st.session_state.editor_key += 1
+    trigger_source = "Generate Button"
 elif clear_edits_button:
     if st.session_state.user_edits:
         st.session_state.user_edits = {}
         needs_recalculation = True
         st.sidebar.success("Edits cleared.")
         st.session_state.editor_key += 1
+        trigger_source = "Clear Edits Button"
     else:
         st.sidebar.info("No user edits to clear.")
 elif st.session_state.df_results is not None and not st.session_state.df_results.empty and current_params != st.session_state.get('last_params', {}):
-     st.sidebar.info("Parameters changed. Recalculating...")
-     st.session_state.user_edits = {}
+     #st.sidebar.info("Parameters changed. Recalculating...") # Can be noisy
+     st.session_state.user_edits = {} # Clear edits on param change
      needs_recalculation = True
      st.session_state.editor_key += 1
+     trigger_source = "Parameter Change"
 
 if needs_recalculation and valid_inputs:
+    #st.info(f"Recalculating projections... Triggered by: {trigger_source}")
     st.session_state.df_results = calculate_projections(
         initial_capital, fixed_costs_initial, variable_cost_per_unit,
         selling_price_per_unit_initial, sales_percentage, ci_months, ci_amounts,
@@ -387,30 +428,40 @@ if needs_recalculation and valid_inputs:
 if 'df_results' in st.session_state and not st.session_state.df_results.empty:
 
     st.header("Monthly Projections")
-    st.caption(f"Editable Columns: {', '.join(EDITABLE_COLUMNS)}. Currency Format: {format_currency_editor(current_currency)}")
+    currency_symbol = "₹" if current_currency == "INR" else "$"
+    st.caption(f"Editable Columns: {', '.join(EDITABLE_COLUMNS)}. Currency: {current_currency}")
 
     df_editable = st.session_state.df_results.copy()
 
     # --- Configure Columns for Editor ---
-    editor_currency_format = format_currency_editor(current_currency)
+    # *** FIX: Use standard formats, add currency to label ***
     column_config = {}
     for col in df_editable.columns:
-        if col == "Month":
-            column_config[col] = st.column_config.NumberColumn(disabled=True)
-        elif col in CURRENCY_COLUMNS:
-             # Apply currency format; check if editable
-             column_config[col] = st.column_config.NumberColumn(
-                 label=f"{col} (Editable)" if col in EDITABLE_COLUMNS else col,
-                 format=editor_currency_format, # Apply currency symbol format
-                 disabled=col not in EDITABLE_COLUMNS,
-                 min_value=0 if col in ["Fixed Costs", "Selling Price Per Unit"] else None # Basic validation
-             )
-        elif col in ["Inventory Units Start", "Units Produced", "Units Available", "Units Sold", "Inventory Units End"]:
-             column_config[col] = st.column_config.NumberColumn(format="%d", disabled=True) # Integer units
+        label = col.replace("_", " ") # Basic label formatting
+        is_editable = col in EDITABLE_COLUMNS
+        is_currency = col in CURRENCY_COLUMNS
+        is_unit = "Units" in col # Simple check for unit columns
+
+        fmt = None
+        if is_currency:
+            fmt = "%.2f" # Standard float format for currency
+            if is_editable: label = f"{label} ({currency_symbol}) (Editable)"
+            else: label = f"{label} ({currency_symbol})"
+        elif is_unit:
+            fmt = "%d" # Integer format for units
         elif col == "Profit Margin (%)":
-             column_config[col] = st.column_config.NumberColumn(format="%.2f%%", disabled=True)
-        else: # Default for any other columns
-            column_config[col] = st.column_config.Column(disabled=True)
+             fmt = "%.2f%%"
+
+        column_config[col] = st.column_config.NumberColumn(
+            label=label,
+            format=fmt, # Use standard format
+            disabled=not is_editable,
+            # Add validation if needed (e.g., min_value)
+            min_value=0 if col in ["Fixed Costs", "Selling Price Per Unit"] else None
+        )
+
+    # Specific override for Month (not a NumberColumn maybe?)
+    column_config["Month"] = st.column_config.Column(label="Month", disabled=True)
 
 
     editor_instance_key = f"data_editor_{st.session_state.editor_key}"
@@ -425,90 +476,118 @@ if 'df_results' in st.session_state and not st.session_state.df_results.empty:
     )
 
     # --- Detect and Process Edits ---
+    # (Edit detection logic remains similar, using editor state)
     editor_state = st.session_state.get(editor_instance_key, {})
     edited_rows_dict = editor_state.get("edited_rows", {})
     edits_found_in_editor = False
     potential_new_edits = {}
 
     if edited_rows_dict:
-        if 'Month' in st.session_state.df_results.columns:
+        # Create lookup only if results exist
+        original_lookup = None
+        if not st.session_state.df_results.empty and 'Month' in st.session_state.df_results.columns:
              original_lookup = st.session_state.df_results.set_index('Month')
-        else: # Should have Month column, but fallback
-             original_lookup = st.session_state.df_results.copy() # Ensure index alignment if needed later
 
         for row_index, changed_cells in edited_rows_dict.items():
-             if row_index < len(st.session_state.df_results):
+             if row_index < len(st.session_state.df_results): # Check bounds
                  month = st.session_state.df_results.loc[row_index, "Month"]
                  for col_name, new_value in changed_cells.items():
                      if col_name in EDITABLE_COLUMNS:
-                         # Basic validation
+                         # Validation
                          is_valid_edit = True
-                         if col_name == "Fixed Costs" and new_value < 0:
-                             st.warning(f"Month {month}: Fixed Costs cannot be negative. Change ignored.")
-                             is_valid_edit = False
-                         if col_name == "Selling Price Per Unit" and new_value <= 0:
-                             st.warning(f"Month {month}: Selling Price must be positive. Change ignored.")
-                             is_valid_edit = False
+                         # Handle potential non-numeric values from editor if format fails
+                         if not isinstance(new_value, (int, float)):
+                              st.warning(f"Invalid input type '{type(new_value)}' for {col_name} in month {month}. Ignoring edit.")
+                              is_valid_edit = False
+                         elif col_name == "Fixed Costs" and new_value < 0:
+                              st.warning(f"Month {month}: Fixed Costs cannot be negative. Change ignored.")
+                              is_valid_edit = False
+                         elif col_name == "Selling Price Per Unit" and new_value <= 0:
+                              st.warning(f"Month {month}: Selling Price must be positive. Change ignored.")
+                              is_valid_edit = False
 
-                         if is_valid_edit:
-                             original_value = None
-                             current_override = st.session_state.user_edits.get((month, col_name))
+                         if is_valid_edit and original_lookup is not None:
                              try:
                                  # Use original df_results for comparison base
                                  original_value_from_calc = original_lookup.loc[month, col_name]
+                                 current_override = st.session_state.user_edits.get((month, col_name))
                                  value_to_compare = current_override if current_override is not None else original_value_from_calc
 
-                                 # Check if editor value is meaningfully different
-                                 # st.data_editor should return raw number despite format string
-                                 if value_to_compare is None or not math.isclose(new_value, value_to_compare):
+                                 # Check if editor value is meaningfully different (allow for float precision)
+                                 if value_to_compare is None or not math.isclose(new_value, value_to_compare, rel_tol=1e-6):
                                      potential_new_edits[(month, col_name)] = new_value
                                      edits_found_in_editor = True
                              except KeyError:
                                  st.warning(f"Original value lookup failed for Month {month}, {col_name}.")
-                             except TypeError:
-                                 st.error(f"Type error comparing edit for {col_name}. New: {new_value} ({type(new_value)}), Old: {value_to_compare} ({type(value_to_compare)})")
+                             except TypeError as e:
+                                 st.error(f"Type error comparing edit for {col_name} M{month}: {e}. New: {new_value}, Old: {value_to_compare}")
 
 
     # If valid edits found, update state and rerun
     if edits_found_in_editor and valid_inputs:
-         # Check if potential edits actually differ from current user edits
          changed_edits = False
          for k, v in potential_new_edits.items():
-             if k not in st.session_state.user_edits or not math.isclose(v, st.session_state.user_edits[k]):
+             # Check against existing edits, considering float tolerance
+             existing_edit = st.session_state.user_edits.get(k)
+             if existing_edit is None or not math.isclose(v, existing_edit, rel_tol=1e-6):
                  st.session_state.user_edits[k] = v
                  changed_edits = True
 
          if changed_edits:
-             # print("User edits updated:", st.session_state.user_edits) # Debug
+             #st.info("Edits detected, rerunning calculation...") # Can be noisy
              st.rerun()
 
 
     # --- Display Formatted Monthly Table (Read-Only) ---
-    # Optional: Show a read-only version with mn/bn formatting if needed
-    # st.header("Formatted Monthly View (Read-Only)")
-    # df_display = st.session_state.df_results.copy()
-    # for col in CURRENCY_COLUMNS:
-    #      if col in df_display.columns:
-    #           df_display[col] = st.session_state.df_results[col].apply(lambda x: format_currency_display(x, current_currency))
-    # # ... format units ...
-    # st.dataframe(df_display, ...)
+    # *** FIX: Reinstate this for easier visual scanning with mn/bn/k ***
+    st.header("Formatted Monthly View (Read-Only)")
+    st.caption("This view uses k/mn/bn suffixes for large numbers.")
+    df_display = st.session_state.df_results.copy()
+
+    # Identify columns to format
+    cols_to_format_currency = [col for col in df_display.columns if col in CURRENCY_COLUMNS]
+    cols_to_format_units = [col for col in df_display.columns if "Units" in col] # Includes inventory, produced, sold etc.
+
+    for col in cols_to_format_currency:
+         df_display[col] = df_display[col].apply(lambda x: format_currency_display(x, current_currency))
+    for col in cols_to_format_units:
+         df_display[col] = df_display[col].apply(format_units)
+    if "Profit Margin (%)" in df_display.columns:
+        df_display["Profit Margin (%)"] = df_display["Profit Margin (%)"].apply(lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else "N/A")
+
+
+    # Define display order (optional)
+    display_order = [
+        "Month", "Starting Capital", "Fixed Costs", "Units Produced", "Variable Costs",
+        "Units Sold", "Revenue", "Gross Profit", "Operating Profit",
+        "Capital Injection", "Ending Capital", "Inventory Units End", "Inventory Value"
+    ]
+    display_cols = [col for col in display_order if col in df_display.columns] + \
+                   [col for col in df_display.columns if col not in display_order] # Add any remaining columns
+
+    st.dataframe(df_display[display_cols], hide_index=True, use_container_width=True)
 
 
     # --- Display Monthly Chart ---
+    # (Monthly chart logic remains the same)
     st.header("Monthly Trends Chart")
     chart_df_monthly = st.session_state.df_results.copy()
     if current_currency == 'USD':
         for col in CURRENCY_COLUMNS:
             if col in chart_df_monthly.columns and INR_TO_USD != 0:
-                chart_df_monthly[col] = chart_df_monthly[col] / INR_TO_USD
+                try: # Add try-except for robustness
+                    chart_df_monthly[col] = chart_df_monthly[col] / INR_TO_USD
+                except TypeError:
+                    chart_df_monthly[col] = 0 # Handle potential non-numeric data after edits?
 
     fig_monthly = go.Figure()
-    # Add key traces (ensure columns exist)
-    if "Ending Capital" in chart_df_monthly.columns: fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly["Ending Capital"], mode='lines', name='Ending Capital (Cash)'))
-    if "Revenue" in chart_df_monthly.columns: fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly["Revenue"], mode='lines', name='Revenue'))
-    if "Operating Profit" in chart_df_monthly.columns: fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly["Operating Profit"], mode='lines', name='Operating Profit', line=dict(dash='dot')))
-    if "Inventory Value" in chart_df_monthly.columns: fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly["Inventory Value"], mode='lines', name='Inventory Value', line=dict(dash='dash')))
-    if "Capital Injection" in chart_df_monthly.columns: fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly["Capital Injection"], mode='lines', name='Capital Injection'))
+    plot_cols_monthly = {"Ending Capital": "Ending Capital (Cash)", "Revenue": "Revenue", "Operating Profit": "Operating Profit", "Inventory Value": "Inventory Value", "Capital Injection": "Capital Injection"}
+    for col, name in plot_cols_monthly.items():
+        if col in chart_df_monthly.columns:
+             line_style = {}
+             if "Profit" in col: line_style = dict(dash='dot')
+             if "Inventory" in col: line_style = dict(dash='dash')
+             fig_monthly.add_trace(go.Scatter(x=chart_df_monthly["Month"], y=chart_df_monthly[col], mode='lines', name=name, line=line_style))
 
     fig_monthly.update_layout(
         title="Key Monthly Financial Trends", xaxis_title="Month", yaxis_title=f"Amount ({current_currency})",
@@ -516,87 +595,73 @@ if 'df_results' in st.session_state and not st.session_state.df_results.empty:
     )
     st.plotly_chart(fig_monthly, use_container_width=True)
 
-
     st.divider() # Add a visual separator
-
 
     # --- Quarterly / Annual Summaries ---
     st.header("Aggregated Financial Summaries")
-    summary_period = st.radio("Select Summary Period:", ("Quarterly", "Annual"), index=0, horizontal=True)
+    summary_period = st.radio("Select Summary Period:", ("Quarterly", "Annual"), index=0, horizontal=True, key="summary_period_toggle") # Add key
 
+    # *** Ensure vc_per_unit is passed correctly ***
     pnl_summary, bs_summary, cf_summary = generate_summary_tables(
         st.session_state.df_results,
         period=summary_period,
-        vc_per_unit=variable_cost_per_unit # Pass VC for inventory valuation
+        vc_per_unit=variable_cost_per_unit # Pass current VC for inventory valuation
         )
 
-    # Apply currency formatting for display tables (using mn/bn helper)
-    pnl_display = pnl_summary.copy()
-    bs_display = bs_summary.copy()
-    cf_display = cf_summary.copy()
+    # Display only if summaries are not empty
+    if not pnl_summary.empty:
+        pnl_display = pnl_summary.copy()
+        bs_display = bs_summary.copy()
+        cf_display = cf_summary.copy()
 
-    # Select only numeric columns that represent currency for formatting display tables
-    pnl_currency_cols = pnl_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
-    bs_currency_cols = bs_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
-    cf_currency_cols = cf_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
+        pnl_currency_cols = pnl_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
+        bs_currency_cols = bs_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
+        cf_currency_cols = cf_display.select_dtypes(include='number').columns.drop(['Year', 'Quarter'], errors='ignore')
 
-    for df_disp, cols in zip([pnl_display, bs_display, cf_display], [pnl_currency_cols, bs_currency_cols, cf_currency_cols]):
-         for col in cols:
-             if col in df_disp.columns:
-                 df_disp[col] = df_disp[col].apply(lambda x: format_currency_display(x, current_currency))
+        for df_disp, cols in zip([pnl_display, bs_display, cf_display], [pnl_currency_cols, bs_currency_cols, cf_currency_cols]):
+             for col in cols:
+                 if col in df_disp.columns:
+                     df_disp[col] = df_disp[col].apply(lambda x: format_currency_display(x, current_currency))
 
+        col_summary1, col_summary2 = st.columns(2)
+        with col_summary1:
+            st.subheader(f"{summary_period} Income Statement (P&L)")
+            st.dataframe(pnl_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
+            st.subheader(f"{summary_period} Cash Flow Statement")
+            st.dataframe(cf_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
+        with col_summary2:
+            st.subheader(f"{summary_period} Balance Sheet")
+            st.dataframe(bs_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
 
-    col_summary1, col_summary2 = st.columns(2)
-
-    with col_summary1:
-        st.subheader(f"{summary_period} Income Statement (P&L)")
-        st.dataframe(pnl_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
-
-        st.subheader(f"{summary_period} Cash Flow Statement")
-        st.dataframe(cf_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
-
-    with col_summary2:
-        st.subheader(f"{summary_period} Balance Sheet")
-        st.dataframe(bs_display.drop(columns=['Year', 'Quarter'], errors='ignore'), hide_index=True, use_container_width=True)
-
-
-    # --- Summary Charts ---
-    st.subheader(f"{summary_period} Financial Charts")
-
-    # P&L Chart (Revenue vs Profit)
-    fig_pnl = px.bar(pnl_summary, x='Period', y=['Revenue', 'Operating Profit'],
-                     title=f'{summary_period} Revenue & Operating Profit',
-                     labels={'value': f'Amount ({current_currency})', 'variable': 'Metric'},
-                     barmode='group')
-    fig_pnl.update_layout(hovermode="x unified")
-    st.plotly_chart(fig_pnl, use_container_width=True)
-
-    # Balance Sheet Chart (Assets)
-    fig_bs = px.bar(bs_summary, x='Period', y=['Cash', 'Inventory Value', 'Total Assets'],
-                     title=f'{summary_period} Assets Breakdown',
-                     labels={'value': f'Amount ({current_currency})', 'variable': 'Asset Type'},
-                     barmode='group') # Use 'stack' for stacked bar chart if preferred
-    fig_bs.update_layout(hovermode="x unified")
-    st.plotly_chart(fig_bs, use_container_width=True)
-
-    # Cash Flow Chart
-    fig_cf = px.bar(cf_summary, x='Period', y=['Cash from Operations', 'Cash from Financing', 'Net Change in Cash'],
-                     title=f'{summary_period} Cash Flow Components',
-                     labels={'value': f'Amount ({current_currency})', 'variable': 'Cash Flow Type'},
-                     barmode='group')
-    fig_cf.update_layout(hovermode="x unified")
-    st.plotly_chart(fig_cf, use_container_width=True)
-
+        # --- Summary Charts ---
+        st.subheader(f"{summary_period} Financial Charts")
+        # (Chart logic remains similar, ensure 'Period' column exists)
+        if 'Period' in pnl_summary.columns:
+             fig_pnl = px.bar(pnl_summary, x='Period', y=['Revenue', 'Operating Profit'], title=f'{summary_period} Revenue & Operating Profit', labels={'value': f'Amount ({current_currency})', 'variable': 'Metric'}, barmode='group')
+             fig_pnl.update_layout(hovermode="x unified")
+             st.plotly_chart(fig_pnl, use_container_width=True)
+        if 'Period' in bs_summary.columns:
+             fig_bs = px.bar(bs_summary, x='Period', y=['Cash', 'Inventory Value', 'Total Assets'], title=f'{summary_period} Assets Breakdown', labels={'value': f'Amount ({current_currency})', 'variable': 'Asset Type'}, barmode='group')
+             fig_bs.update_layout(hovermode="x unified")
+             st.plotly_chart(fig_bs, use_container_width=True)
+        if 'Period' in cf_summary.columns:
+             fig_cf = px.bar(cf_summary, x='Period', y=['Cash from Operations', 'Cash from Financing', 'Net Change in Cash'], title=f'{summary_period} Cash Flow Components', labels={'value': f'Amount ({current_currency})', 'variable': 'Cash Flow Type'}, barmode='group')
+             fig_cf.update_layout(hovermode="x unified")
+             st.plotly_chart(fig_cf, use_container_width=True)
+    else:
+        st.info(f"Not enough data to display {summary_period} summaries.")
 
 else:
-    # Show only if calculation hasn't run or failed
+    # Initial state or after error preventing df_results generation
     if valid_inputs:
          st.info("Click 'Generate Projections' in the sidebar to start.")
     else:
          st.warning("Please correct the errors in the sidebar inputs before generating.")
 
 # --- Optional Debug Info ---
+# (Debug expander can be uncommented if needed)
 # with st.expander("Debug Info"):
-#      st.write("User Edits:", st.session_state.get('user_edits', {}))
-#      st.write("Last Params:", st.session_state.get('last_params', {}))
-#      st.write("Editor Key:", st.session_state.get('editor_key', 0))
+#     st.write("User Edits:", st.session_state.get('user_edits', {}))
+#     st.write("Last Params:", st.session_state.get('last_params', {}))
+#     st.write("Editor Key:", st.session_state.get('editor_key', 0))
+#     st.write("Current Params:", current_params)
