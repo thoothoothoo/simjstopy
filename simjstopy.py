@@ -160,120 +160,130 @@ def aggregate_and_calculate_kpis(monthly_df):
         yearly_agg = df.groupby('Year').agg(agg_rules)
 
     # --- Calculate Financial Summary Metrics (Quarterly & Yearly) ---
-def create_summary_table(q_summary, y_summary, q_kpis, y_kpis, currency):
-    # Define which metrics go where
-    fin_summary_metrics = {
-        'Revenue': 'Revenue', 'Operating Expenses': 'Total Costs', 'Net Profit': 'Profit',
-        'Profit Margin (%)': 'Profit Margin (%)', 'Starting Capital': 'Starting Capital',
-        'Ending Capital': 'Ending Capital', 'Total Assets (Est.)': 'Total Assets (Est.)',
-        'Total Liabilities (Est.)': 'Total Liabilities (Est.)', 'Equity (Est.)': 'Equity (Est.)'
-    }
-    kpi_metrics = {
-        'Revenue Growth Rate (%)': 'Revenue Growth Rate (%)', 'Profit Growth Rate (%)': 'Profit Growth Rate (%)',
-        'Gross Profit Margin (%)': 'Gross Profit Margin (%)', 'Operating Profit Margin (%)': 'Operating Profit Margin (%)',
-        'Net Profit Margin (%)': 'Net Profit Margin (%)', 'Units Produced': 'Units Produced',
-        'Revenue per Unit': 'Revenue per Unit', 'Cost per Unit': 'Cost per Unit'
-    }
+    def create_summary_table(q_summary, y_summary, q_kpis, y_kpis, currency):
+        # Define which metrics go where
+        fin_summary_metrics = {
+            'Revenue': 'Revenue', 'Operating Expenses': 'Total Costs', 'Net Profit': 'Profit',
+            'Profit Margin (%)': 'Profit Margin (%)', 'Starting Capital': 'Starting Capital',
+            'Ending Capital': 'Ending Capital', 'Total Assets (Est.)': 'Total Assets (Est.)',
+            'Total Liabilities (Est.)': 'Total Liabilities (Est.)', 'Equity (Est.)': 'Equity (Est.)'
+        }
+        kpi_metrics = {
+            'Revenue Growth Rate (%)': 'Revenue Growth Rate (%)', 'Profit Growth Rate (%)': 'Profit Growth Rate (%)',
+            'Gross Profit Margin (%)': 'Gross Profit Margin (%)', 'Operating Profit Margin (%)': 'Operating Profit Margin (%)',
+            'Net Profit Margin (%)': 'Net Profit Margin (%)', 'Units Produced': 'Units Produced',
+            'Revenue per Unit': 'Revenue per Unit', 'Cost per Unit': 'Cost per Unit'
+        }
 
-    # Function to build one transposed table
-def build_table(metrics_map, q_data, y_data):
-        q_cols = {f"Q{i}": q_data.loc[i] for i in q_data.index}
-        y_cols = {}
-        if not y_data.empty:
-            y_cols = {f"Y{i} Total": y_data.loc[i] for i in y_data.index}
+        # Function to build one transposed table
+        def build_table(metrics_map, q_data, y_data):
+            q_cols = {f"Q{i}": q_data.loc[i] for i in q_data.index}
+            y_cols = {}
+            if not y_data.empty:
+                y_cols = {f"Y{i} Total": y_data.loc[i] for i in y_data.index}
 
-        combined_data = {}
-        for display_name, data_key in metrics_map.items():
-            row_data = {}
-            # Quarterly values
-            for q_label, q_series in q_cols.items():
-                if data_key in q_series:
-                    row_data[q_label] = q_series[data_key]
-                else:
-                    row_data[q_label] = np.nan # Metric not found in this dataset
-
-            # Yearly values
-            if y_cols:
-                for y_label, y_series in y_cols.items():
-                    if data_key in y_series:
-                       row_data[y_label] = y_series[data_key]
+            combined_data = {}
+            for display_name, data_key in metrics_map.items():
+                row_data = {}
+                # Quarterly values
+                for q_label, q_series in q_cols.items():
+                    if data_key in q_series:
+                        row_data[q_label] = q_series[data_key]
                     else:
-                       row_data[y_label] = np.nan # Metric not found
-            else:
-                 # Add placeholder columns if no yearly data exists but expected
-                 if any(k.startswith('Y') for k in list(q_cols.keys()) + list(y_cols.keys())): # Check if yearly columns expected
-                     num_years_expected = len(q_data)//4 # Estimate
-                     for i in range(1, num_years_expected + 1):
-                          row_data[f'Y{i} Total'] = np.nan
+                        row_data[q_label] = np.nan # Metric not found in this dataset
 
-            # Q/Q and Y/Y Changes (use latest available period's calculated growth/value)
-            last_q_key = f"Q{q_data.index.max()}"
-            if last_q_key in row_data and len(q_data) > 1:
-                 # For growth rates/margins, Q/Q change is just the latest value
-                 if '%' in display_name:
-                     row_data['Q/Q Change'] = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
-                 # For absolute values, calculate % change if possible
-                 elif q_data.index.max() > q_data.index.min():
-                     prev_q_val = q_data.loc[q_data.index.max() - 1, data_key] if data_key in q_data.columns else np.nan
-                     last_q_val = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
-                     if not pd.isna(prev_q_val) and not pd.isna(last_q_val) and prev_q_val != 0:
-                         row_data['Q/Q Change'] = ((last_q_val / prev_q_val) - 1) * 100
-                     else:
-                         row_data['Q/Q Change'] = np.nan
-                 else:
-                      row_data['Q/Q Change'] = np.nan
-            else:
-                row_data['Q/Q Change'] = np.nan
+                # Yearly values
+                if y_cols:
+                    for y_label, y_series in y_cols.items():
+                        if data_key in y_series:
+                           row_data[y_label] = y_series[data_key]
+                        else:
+                           row_data[y_label] = np.nan # Metric not found
+                else:
+                     # Add placeholder columns if no yearly data exists but expected
+                     if any(k.startswith('Y') for k in list(q_cols.keys()) + list(y_cols.keys())): # Check if yearly columns expected
+                         num_years_expected = len(q_data)//4 # Estimate
+                         for i in range(1, num_years_expected + 1):
+                              row_data[f'Y{i} Total'] = np.nan
 
-            if not y_data.empty and y_data.index.max() > y_data.index.min():
-                 last_y_key = f"Y{y_data.index.max()} Total"
-                 # Similar logic for Y/Y change
-                 if '%' in display_name:
-                     row_data['Y/Y Change'] = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
-                 elif y_data.index.max() > y_data.index.min():
-                     prev_y_val = y_data.loc[y_data.index.max() - 1, data_key] if data_key in y_data.columns else np.nan
-                     last_y_val = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
-                     if not pd.isna(prev_y_val) and not pd.isna(last_y_val) and prev_y_val != 0:
-                         row_data['Y/Y Change'] = ((last_y_val / prev_y_val) - 1) * 100
+                # Q/Q and Y/Y Changes (use latest available period's calculated growth/value)
+                last_q_key = f"Q{q_data.index.max()}"
+                if last_q_key in row_data and len(q_data) > 1:
+                     # For growth rates/margins, Q/Q change is just the latest value
+                     if '%' in display_name:
+                         row_data['Q/Q Change'] = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
+                     # For absolute values, calculate % change if possible
+                     elif q_data.index.max() > q_data.index.min():
+                         prev_q_val = q_data.loc[q_data.index.max() - 1, data_key] if data_key in q_data.columns else np.nan
+                         last_q_val = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
+                         if not pd.isna(prev_q_val) and not pd.isna(last_q_val) and prev_q_val != 0:
+                             row_data['Q/Q Change'] = ((last_q_val / prev_q_val) - 1) * 100
+                         else:
+                             row_data['Q/Q Change'] = np.nan
+                    else:
+                        row_data['Q/Q Change'] = np.nan
+                else:
+                    row_data['Q/Q Change'] = np.nan
+
+                if not y_data.empty and y_data.index.max() > y_data.index.min():
+                     last_y_key = f"Y{y_data.index.max()} Total"
+                     # Similar logic for Y/Y change
+                     if '%' in display_name:
+                         row_data['Y/Y Change'] = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
+                     elif y_data.index.max() > y_data.index.min():
+                         prev_y_val = y_data.loc[y_data.index.max() - 1, data_key] if data_key in y_data.columns else np.nan
+                         last_y_val = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
+                         if not pd.isna(prev_y_val) and not pd.isna(last_y_val) and prev_y_val != 0:
+                             row_data['Y/Y Change'] = ((last_y_val / prev_y_val) - 1) * 100
+                         else:
+                              row_data['Y/Y Change'] = np.nan
                      else:
-                          row_data['Y/Y Change'] = np.nan
-                 else:
+                         row_data['Y/Y Change'] = np.nan
+                else:
                      row_data['Y/Y Change'] = np.nan
-            else:
-                 row_data['Y/Y Change'] = np.nan
 
-            combined_data[display_name] = row_data
+                combined_data[display_name] = row_data
 
-        # Create DataFrame and order columns
-        result_df = pd.DataFrame(combined_data).T # Transpose here!
-        col_order = list(q_cols.keys()) + list(y_cols.keys()) + ['Q/Q Change', 'Y/Y Change']
-        # Ensure all expected columns exist, adding NaN columns if needed
-        for col in col_order:
-            if col not in result_df.columns:
-                result_df[col] = np.nan
-        return result_df[col_order]
+            # Create DataFrame and order columns
+            result_df = pd.DataFrame(combined_data).T # Transpose here!
+            col_order = list(q_cols.keys()) + list(y_cols.keys()) + ['Q/Q Change', 'Y/Y Change']
+            # Ensure all expected columns exist, adding NaN columns if needed
+            for col in col_order:
+                if col not in result_df.columns:
+                    result_df[col] = np.nan
+            return result_df[col_order]
 
-    # Build the two tables
-    fin_table = build_table(fin_summary_metrics, q_summary, y_summary)
-    kpi_table = build_table(kpi_metrics, q_kpis, y_kpis)
+        # Build the two tables
+        fin_table = build_table(fin_summary_metrics, q_summary, y_summary)
+        kpi_table = build_table(kpi_metrics, q_kpis, y_kpis)
 
-    # Apply Formatting
-def format_df(df_to_format):
-        formatted_df = df_to_format.copy().astype(object) # Work on copy, ensure object type
-        for metric, row in df_to_format.iterrows():
-            for col_name, value in row.items():
-                if pd.isna(value):
-                   formatted_df.loc[metric, col_name] = 'N/A'
-                   continue
+        # Apply Formatting
+        def format_df(df_to_format):
+            formatted_df = df_to_format.copy().astype(object) # Work on copy, ensure object type
+            for metric, row in df_to_format.iterrows():
+                for col_name, value in row.items():
+                    if pd.isna(value):
+                       formatted_df.loc[metric, col_name] = 'N/A'
+                       continue
 
-                if '%' in metric or 'Change' in col_name:
-                    formatted_df.loc[metric, col_name] = format_percentage(value)
-                elif 'Unit' in metric:
-                     formatted_df.loc[metric, col_name] = format_currency(value, currency, use_units=False)
-                elif 'Units' in metric:
-                    formatted_df.loc[metric, col_name] = format_units(value)
-                else: # Assume currency
-                    formatted_df.loc[metric, col_name] = format_currency(value, currency)
-        return formatted_df
+                    if '%' in metric or 'Change' in col_name:
+                        formatted_df.loc[metric, col_name] = format_percentage(value)
+                    elif 'Unit' in metric:
+                         formatted_df.loc[metric, col_name] = format_currency(value, currency, use_units=False)
+                    elif 'Units' in metric:
+                        formatted_df.loc[metric, col_name] = format_units(value)
+                    else: # Assume currency
+                        formatted_df.loc[metric, col_name] = format_currency(value, currency)
+            return formatted_df
 
-return format_df(fin_table), format_df(kpi_table)
+        return format_df(fin_table), format_df(kpi_table)
+
+    # Calculate KPIs for quarters and years
+    q_summary = quarterly_agg.copy()
+    y_summary = yearly_agg.copy()
+    q_kpis = quarterly_agg.copy()
+    y_kpis = yearly_agg.copy()
+
+    fin_summary, kpi_summary = create_summary_table(q_summary, y_summary, q_kpis, y_kpis, 'INR')
+
+    return fin_summary, kpi_summary
