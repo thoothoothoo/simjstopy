@@ -1,455 +1,260 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import plotly.graph_objects as go
+import math
+import ast # For safely evaluating list inputs
 
-# --- Constants & Configuration ---
-st.set_page_config(layout="wide", page_title="Financial Projection Tool")
-INR_TO_USD = 85.0
+# --- Constants ---
+INR_TO_USD = 85.0  # Use float for division
 
-# --- Formatting Helpers ---
-def format_currency(amount, currency, use_units=True):
-    if pd.isna(amount) or not np.isfinite(amount):
-        return "N/A"
-    value = amount / (INR_TO_USD if currency == 'USD' else 1)
-    sign = '-' if value < 0 else ''
-    absValue = abs(value)
-    if not use_units:
-        currency_symbol = "$" if currency == 'USD' else "₹"
-        return f"{currency_symbol}{value:,.2f}"
-    if absValue >= 1e9:
-        return f"{sign}{(absValue / 1e9):.1f} bn"
-    elif absValue >= 1e6:
-        return f"{sign}{(absValue / 1e6):.1f} mn"
-    elif absValue >= 1e3:
-        return f"{sign}{(absValue / 1e3):.1f} k"
+# --- Helper Functions ---
+
+def format_currency(amount, currency):
+    """Formats currency values with mn/bn suffixes based on selected currency."""
+    if currency == 'USD':
+        amount /= INR_TO_USD
+    
+    abs_amount = abs(amount)
+    sign = "-" if amount < 0 else ""
+
+    if abs_amount >= 1e9:
+        return f"{sign}{(abs_amount / 1e9):.1f} bn"
+    elif abs_amount >= 1e6:
+        return f"{sign}{(abs_amount / 1e6):.1f} mn"
     else:
-        return f"{sign}{value:.0f}"
-
+        # Use f-string formatting for consistent decimal places
+        return f"{sign}{amount:,.2f}" 
 
 def format_units(units):
-    if pd.isna(units) or not np.isfinite(units):
-        return "N/A"
-    if abs(units) >= 1e9:
-        return f"{(units / 1e9):.1f} bn"
-    elif abs(units) >= 1e6:
-        return f"{(units / 1e6):.1f} mn"
-    elif abs(units) >= 1e3:
-        return f"{(units / 1e3):.1f} k"
+    """Formats unit counts with mn/bn suffixes."""
+    abs_units = abs(units)
+    sign = "-" if units < 0 else "" # Should not be negative, but good practice
+
+    if abs_units >= 1e9:
+        return f"{sign}{(abs_units / 1e9):.1f} bn"
+    elif abs_units >= 1e6:
+        return f"{sign}{(abs_units / 1e6):.1f} mn"
     else:
-        return f"{units:.0f}"
+        # Format as integer if whole number, else with decimals if needed
+        return f"{sign}{int(units):,}" if units == int(units) else f"{sign}{units:,}"
 
+def parse_list_input(input_string, default_value):
+    """Safely parses a string input expected to be a list."""
+    try:
+        parsed_list = ast.literal_eval(input_string)
+        if isinstance(parsed_list, list):
+            return parsed_list
+        else:
+            st.warning(f"Input '{input_string}' is not a valid list. Using default: {default_value}")
+            return default_value
+    except (ValueError, SyntaxError, TypeError):
+        st.warning(f"Could not parse input '{input_string}' as a list. Using default: {default_value}")
+        return default_value
 
-def format_percentage(value):
-    if pd.isna(value) or not np.isfinite(value):
-        return "N/A"
-    return f"{value:.1f}%"
+# --- Streamlit App Layout ---
 
+st.set_page_config(layout="wide") # Use wide layout for better table/chart display
+st.title("Financial Projection Tool")
+
+# --- Input Form ---
+# Use columns for side-by-side layout similar to the original
+col1, col2 = st.columns(2)
+
+with col1:
+    st.header("Business Parameters")
+    initial_capital = st.number_input("Initial Capital (₹):", min_value=0.0, value=200000000.0, step=1000000.0, format="%.2f")
+    fixed_costs_initial = st.number_input("Initial Fixed Costs (₹):", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
+    variable_cost_per_unit = st.number_input("Variable Cost Per Unit (₹):", min_value=0.0, value=13.0, step=0.5, format="%.2f")
+    selling_price_per_unit = st.number_input("Selling Price Per Unit (₹):", min_value=0.0, value=18.0, step=0.5, format="%.2f")
+    # Note: Original JS applies this to the theoretical profit per unit for margin display, not the core profit calc. Replicating that.
+    profit_growth_rate_input = st.number_input("Profit Growth Rate (% per month):", value=-1.0, step=0.1, format="%.2f", help="Affects the theoretical 'Profit Margin (%)' display calculation month-over-month.")
+    
+    ci_months_str = st.text_input("Capital Injection Months (e.g., [9,18,27]):", value="[9,18,27]")
+    ci_amounts_str = st.text_input("Capital Injection Amounts (₹) (e.g., [200000000,200000000,-99999]):", value="[200000000,200000000,-99999]")
+
+with col2:
+    st.header("Growth & Constraints")
+    fixed_cost_growth_rate_input = st.number_input("Fixed Cost Growth Rate (% per month):", value=100.0, step=1.0, format="%.2f")
+    fixed_cost_cap = st.number_input("Fixed Cost Cap (₹):", min_value=0.0, value=999999999.0, step=10000.0, format="%.2f")
+    diseconomies_of_scale_input = st.number_input("Diseconomies of Scale (% of Revenue):", min_value=0.0, value=0.5, step=0.1, format="%.2f")
+    months = st.number_input("Number of Months:", min_value=1, value=36, step=1)
+
+# --- Currency Toggle ---
+st.markdown("---") # Separator
+current_currency = st.radio("Display Currency:", ("INR", "USD"), index=0, horizontal=True)
+st.markdown("---")
+
+# --- Input Validation and Parsing ---
+# Convert percentages to decimals
+profit_growth_rate = profit_growth_rate_input / 100.0
+fixed_cost_growth_rate = fixed_cost_growth_rate_input / 100.0
+diseconomies_of_scale = diseconomies_of_scale_input / 100.0
+
+# Parse list inputs safely
+ci_months = parse_list_input(ci_months_str, [9, 18, 27])
+ci_amounts = parse_list_input(ci_amounts_str, [200000000, 200000000, -99999])
+
+# Validate list lengths
+if len(ci_months) != len(ci_amounts):
+    st.error("Error: The number of 'Capital Injection Months' must match the number of 'Capital Injection Amounts'. Please check your inputs.")
+    st.stop() # Halt execution if lists don't match
+
+# Create a dictionary for quick lookup of capital injections
+capital_injection_map = dict(zip(ci_months, ci_amounts))
 
 # --- Core Calculation Logic ---
-def run_simulation(params):
-    # Destructure parameters
-    initial_capital = params['initial_capital']
-    fixed_costs_start = params['fixed_costs']
-    variable_cost_per_unit = params['variable_cost_per_unit']
-    selling_price_per_unit_start = params['selling_price_per_unit']
-    unit_profit_growth_rate = params['profit_growth_rate']  # Monthly rate
-    fixed_cost_growth_rate = params['fixed_cost_growth_rate']  # Monthly rate
-    fixed_cost_cap = params['fixed_cost_cap']
-    diseconomies_of_scale_rate = params['diseconomies_of_scale']  # Rate (e.g., 0.005 for 0.5%)
-    months = params['months']
-    ci_months = params['ci_months']
-    ci_amounts = params['ci_amounts']
-
-    # Create capital injection dictionary for quick lookup
-    capital_injections = dict(zip(ci_months, ci_amounts))
-
-    # Initialize variables for the loop
-    starting_capital = initial_capital
-    current_fixed_costs = fixed_costs_start
-    monthly_data_list = []
-
-    for month in range(1, months + 1):
-        # Capital available after fixed costs
-        capital_for_production = max(0, starting_capital - current_fixed_costs)
-
-        # Units produced
-        units_produced = 0
-        if variable_cost_per_unit > 0:
-            units_produced = int(capital_for_production // variable_cost_per_unit)
-
-        # Calculate costs and revenue for the month
-        monthly_variable_costs = units_produced * variable_cost_per_unit
-        revenue = units_produced * selling_price_per_unit_start
-        diseconomies_cost = revenue * diseconomies_of_scale_rate
-        total_costs = current_fixed_costs + monthly_variable_costs + diseconomies_cost
-
-        # Profit
-        monthly_profit = revenue - total_costs
-
-        # Capital Injection for this month
-        capital_injection = capital_injections.get(month, 0)
-
-        # Ending Capital
-        ending_capital = starting_capital + monthly_profit + capital_injection
-
-        # Store results
-        monthly_data_list.append({
-            'Month': month,
-            'Starting Capital': starting_capital,
-            'Fixed Costs': current_fixed_costs,
-            'Units Produced': units_produced,
-            'Variable Costs': monthly_variable_costs,
-            'Diseconomies Cost': diseconomies_cost,
-            'Total Costs': total_costs,
-            'Revenue': revenue,
-            'Profit': monthly_profit,
-            'Capital Injection': capital_injection,
-            'Ending Capital': ending_capital,
-            'Var Cost/Unit': variable_cost_per_unit,
-            'Sell Price/Unit': selling_price_per_unit_start
-        })
-
-        # Update fixed costs for next month (with cap)
-        current_fixed_costs = min(current_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
-
-    return pd.DataFrame(monthly_data_list)
+if variable_cost_per_unit >= selling_price_per_unit and profit_growth_rate <= 0:
+     st.warning("Warning: Selling Price per Unit is not greater than Variable Cost Per Unit, and Profit Growth Rate is not positive. Profitability may not be achieved.")
+elif variable_cost_per_unit >= selling_price_per_unit :
+     st.warning("Warning: Selling Price per Unit is not greater than Variable Cost Per Unit.")
 
 
-# --- Data Aggregation and KPI Calculation ---
-def aggregate_and_calculate_kpis(monthly_df):
-    if monthly_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+data = []
+starting_capital = initial_capital
+current_fixed_costs = fixed_costs_initial
+# Initial profit per unit for margin calculation (this value changes based on profit_growth_rate)
+profit_per_unit_for_margin = selling_price_per_unit - variable_cost_per_unit
 
-    df = monthly_df.copy()
-    df['Quarter'] = (df['Month'] - 1) // 3 + 1
-    df['Year'] = (df['Month'] - 1) // 12 + 1
+# Check for division by zero if selling price is zero
+if selling_price_per_unit == 0:
+    st.error("Error: Selling Price Per Unit cannot be zero.")
+    st.stop()
 
-    # Define aggregation rules
-    agg_rules = {
-        'Revenue': 'sum',
-        'Fixed Costs': 'sum',
-        'Variable Costs': 'sum',
-        'Diseconomies Cost': 'sum',
-        'Total Costs': 'sum',
-        'Profit': 'sum',
-        'Units Produced': 'sum',
-        'Capital Injection': 'sum',
-        'Starting Capital': 'first',
-        'Ending Capital': 'last'
+for month in range(1, months + 1):
+    # 1. Calculate funds available after fixed costs
+    remaining_for_production = starting_capital - current_fixed_costs
+
+    # 2. Calculate units produced (avoid division by zero, handle negative remaining funds)
+    units_produced = 0
+    if remaining_for_production > 0 and variable_cost_per_unit > 0:
+        units_produced = math.floor(remaining_for_production / variable_cost_per_unit)
+    elif remaining_for_production > 0 and variable_cost_per_unit == 0:
+         # If variable cost is zero, can theoretically produce infinite units
+         # Handle this case based on desired business logic. Assume 0 for now to avoid infinity.
+         # Or potentially set a max production capacity if that input existed.
+         # For safety and matching JS where this wasn't explicitly handled:
+         units_produced = 0 # Or perhaps calculate based on revenue potential vs remaining capital? Reverting to 0 if VC=0.
+         st.warning(f"Month {month}: Variable cost is zero, setting units produced to 0.")
+
+
+    # 3. Calculate Revenue
+    revenue = units_produced * selling_price_per_unit
+
+    # 4. Calculate Diseconomies Cost
+    diseconomies_cost = revenue * diseconomies_of_scale
+
+    # 5. Calculate Profit (using the EXACT logic from the original JS)
+    # Original JS Profit = revenue - (remainingForProduction + currentFixedCosts + diseconomiesCost)
+    # Which simplifies to: revenue - startingCapital - diseconomiesCost
+    # *** NOTE: This differs from standard accounting profit: Revenue - FixedCosts - VariableCosts - DiseconomiesCost ***
+    # To replicate the JS exactly:
+    profit_js_logic = revenue - (remaining_for_production + current_fixed_costs + diseconomies_cost)
+    # Let's also calculate standard profit for comparison/potential future use
+    variable_costs_total = units_produced * variable_cost_per_unit
+    profit_standard = revenue - current_fixed_costs - variable_costs_total - diseconomies_cost
+    
+    # Using the JS logic profit for ending capital calculation as per original code:
+    profit_for_month = profit_js_logic
+
+    # 6. Calculate Profit Margin Percentage (based on the evolving profit_per_unit_for_margin)
+    # Avoid division by zero if selling_price_per_unit becomes zero (shouldn't happen with input validation but safe)
+    profit_margin_percentage = 0.0
+    if selling_price_per_unit != 0:
+       # Profit margin uses the theoretical profit per unit, which grows/shrinks
+       profit_margin_percentage = (profit_per_unit_for_margin / selling_price_per_unit) * 100
+
+
+    # 7. Check for Capital Injection
+    capital_injection = capital_injection_map.get(month, 0) # Get injection amount or 0 if month not in map
+
+    # 8. Calculate Ending Capital
+    ending_capital = starting_capital + profit_for_month + capital_injection
+
+    # Store results for this month
+    month_data = {
+        "Month": month,
+        "Starting Capital": starting_capital,
+        "Fixed Costs": current_fixed_costs,
+        "Remaining for Prod.": remaining_for_production if remaining_for_production > 0 else 0, # Show 0 if negative
+        "Units Produced": units_produced,
+        "Revenue": revenue,
+        "Profit Margin (%)": profit_margin_percentage, # Theoretical margin based on per-unit price/cost
+        "Profit (JS Logic)": profit_for_month, # Profit calculated as per original JS
+        "Profit (Standard)": profit_standard, # Standard accounting profit
+        "Diseconomies Cost": diseconomies_cost,
+        "Capital Injection": capital_injection,
+        "Ending Capital": ending_capital,
     }
+    data.append(month_data)
 
-    # Aggregate quarterly
-    quarterly_agg = df.groupby('Quarter').agg(agg_rules)
-
-    # Aggregate yearly (if applicable)
-    yearly_agg = pd.DataFrame()  # Initialize empty
-    if df['Year'].max() > 0:
-        yearly_agg = df.groupby('Year').agg(agg_rules)
-
-    # --- Calculate Financial Summary Metrics (Quarterly & Yearly) ---
-    def calculate_summary(agg_df):
-        summary = agg_df.copy()
-        summary['Profit Margin (%)'] = (summary['Profit'] / summary['Revenue'].replace(0, np.nan)) * 100
-        summary['Total Assets (Est.)'] = summary['Ending Capital']  # Approximation
-        summary['Total Liabilities (Est.)'] = 0  # Approximation
-        summary['Equity (Est.)'] = summary['Ending Capital']  # Approximation
-        return summary
-
-    quarterly_summary = calculate_summary(quarterly_agg)
-    yearly_summary = calculate_summary(yearly_agg) if not yearly_agg.empty else pd.DataFrame()
-
-    # --- Calculate KPIs (Quarterly & Yearly) ---
-    def calculate_kpis(agg_df):
-        kpi = pd.DataFrame(index=agg_df.index)
-        # Growth Rates (handle division by zero and missing previous period)
-        kpi['Revenue Growth Rate (%)'] = agg_df['Revenue'].pct_change() * 100
-        kpi['Profit Growth Rate (%)'] = agg_df['Profit'].pct_change() * 100
-        # Margins
-        kpi['Gross Profit Margin (%)'] = ((agg_df['Revenue'] - agg_df['Variable Costs']) / agg_df['Revenue'].replace(0, np.nan)) * 100
-        kpi['Operating Profit Margin (%)'] = ((agg_df['Revenue'] - agg_df['Total Costs']) / agg_df['Revenue'].replace(0, np.nan)) * 100
-        kpi['Net Profit Margin (%)'] = (agg_df['Profit'] / agg_df['Revenue'].replace(0, np.nan)) * 100
-        # Units & Per Unit
-        kpi['Units Produced'] = agg_df['Units Produced']
-        kpi['Revenue per Unit'] = agg_df['Revenue'] / agg_df['Units Produced'].replace(0, np.nan)
-        kpi['Cost per Unit'] = agg_df['Total Costs'] / agg_df['Units Produced'].replace(0, np.nan)
-        return kpi
-
-    quarterly_kpis = calculate_kpis(quarterly_agg)
-    yearly_kpis = calculate_kpis(yearly_agg) if not yearly_agg.empty else pd.DataFrame()
-
-    return quarterly_summary, yearly_summary, quarterly_kpis, yearly_kpis
+    # --- Update for Next Month ---
+    starting_capital = ending_capital
+    current_fixed_costs = min(current_fixed_costs * (1 + fixed_cost_growth_rate), fixed_cost_cap)
+    # Update the theoretical profit per unit used for margin display
+    profit_per_unit_for_margin *= (1 + profit_growth_rate)
+    # Selling price per unit remains constant in the original logic unless profit_per_unit logic implicitly changes it.
+    # Based on JS, selling_price_per_unit is static input. profit_per_unit calculation affects ONLY the margin display.
 
 
-# --- Table Creation ---
-def create_summary_table(q_summary, y_summary, q_kpis, y_kpis, currency):
-    # Define which metrics go where
-    fin_summary_metrics = {
-        'Revenue': 'Revenue', 'Operating Expenses': 'Total Costs', 'Net Profit': 'Profit',
-        'Profit Margin (%)': 'Profit Margin (%)', 'Starting Capital': 'Starting Capital',
-        'Ending Capital': 'Ending Capital', 'Total Assets (Est.)': 'Total Assets (Est.)',
-        'Total Liabilities (Est.)': 'Total Liabilities (Est.)', 'Equity (Est.)': 'Equity (Est.)'
-    }
-    kpi_metrics = {
-        'Revenue Growth Rate (%)': 'Revenue Growth Rate (%)', 'Profit Growth Rate (%)': 'Profit Growth Rate (%)',
-        'Gross Profit Margin (%)': 'Gross Profit Margin (%)', 'Operating Profit Margin (%)': 'Operating Profit Margin (%)',
-        'Net Profit Margin (%)': 'Net Profit Margin (%)', 'Units Produced': 'Units Produced',
-        'Revenue per Unit': 'Revenue per Unit', 'Cost per Unit': 'Cost per Unit'
-    }
+# --- Create DataFrame ---
+df = pd.DataFrame(data)
 
-    # Function to build one transposed table
-    def build_table(metrics_map, q_data, y_data):
-        q_cols = {f"Q{i}": q_data.loc[i] for i in q_data.index}
-        y_cols = {}
-        if not y_data.empty:
-            y_cols = {f"Y{i} Total": y_data.loc[i] for i in y_data.index}
-        combined_data = {}
+# --- Display Table ---
+st.header("Financial Projections Table")
 
-        for display_name, data_key in metrics_map.items():
-            row_data = {}
-            # Quarterly values
-            for q_label, q_series in q_cols.items():
-                if data_key in q_series:
-                    row_data[q_label] = q_series[data_key]
-                else:
-                    row_data[q_label] = np.nan  # Metric not found in this dataset
-            # Yearly values
-            if y_cols:
-                for y_label, y_series in y_cols.items():
-                    if data_key in y_series:
-                        row_data[y_label] = y_series[data_key]
-                    else:
-                        row_data[y_label] = np.nan  # Metric not found
-            else:
-                # Add placeholder columns if no yearly data exists but expected
-                if any(k.startswith('Y') for k in list(q_cols.keys()) + list(y_cols.keys())):  # Check if yearly columns expected
-                    num_years_expected = len(q_data) // 4  # Estimate
-                    for i in range(1, num_years_expected + 1):
-                        row_data[f'Y{i} Total'] = np.nan
-            # Q/Q and Y/Y Changes (use latest available period's calculated growth/value)
-            last_q_key = f"Q{q_data.index.max()}"
-            if last_q_key in row_data and len(q_data) > 1:
-                # For growth rates/margins, Q/Q change is just the latest value
-                if '%' in display_name:
-                    row_data['Q/Q Change'] = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
-                # For absolute values, calculate % change if possible
-                elif q_data.index.max() > q_data.index.min():
-                    prev_q_val = q_data.loc[q_data.index.max() - 1, data_key] if data_key in q_data.columns else np.nan
-                    last_q_val = q_data.loc[q_data.index.max(), data_key] if data_key in q_data.columns else np.nan
-                    if not pd.isna(prev_q_val) and not pd.isna(last_q_val) and prev_q_val != 0:
-                        row_data['Q/Q Change'] = ((last_q_val / prev_q_val) - 1) * 100
-                    else:
-                        row_data['Q/Q Change'] = np.nan
-                else:
-                    row_data['Q/Q Change'] = np.nan
-            else:
-                row_data['Q/Q Change'] = np.nan
-            if not y_data.empty and y_data.index.max() > y_data.index.min():
-                last_y_key = f"Y{y_data.index.max()} Total"
-                # Similar logic for Y/Y change
-                if '%' in display_name:
-                    row_data['Y/Y Change'] = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
-                elif y_data.index.max() > y_data.index.min():
-                    prev_y_val = y_data.loc[y_data.index.max() - 1, data_key] if data_key in y_data.columns else np.nan
-                    last_y_val = y_data.loc[y_data.index.max(), data_key] if data_key in y_data.columns else np.nan
-                    if not pd.isna(prev_y_val) and not pd.isna(last_y_val) and prev_y_val != 0:
-                        row_data['Y/Y Change'] = ((last_y_val / prev_y_val) - 1) * 100
-                    else:
-                        row_data['Y/Y Change'] = np.nan
-                else:
-                    row_data['Y/Y Change'] = np.nan
-            else:
-                row_data['Y/Y Change'] = np.nan
-            combined_data[display_name] = row_data
+# Create a copy for display formatting
+df_display = df.copy()
 
-        # Create DataFrame and order columns
-        result_df = pd.DataFrame(combined_data).T  # Transpose here!
-        col_order = list(q_cols.keys()) + list(y_cols.keys()) + ['Q/Q Change', 'Y/Y Change']
-        # Ensure all expected columns exist, adding NaN columns if needed
-        for col in col_order:
-            if col not in result_df.columns:
-                result_df[col] = np.nan
-        return result_df[col_order]
+# Apply formatting based on selected currency
+currency_symbol = "₹" if current_currency == "INR" else "$"
+amount_cols = ["Starting Capital", "Fixed Costs", "Remaining for Prod.", "Revenue",
+               "Profit (JS Logic)", "Profit (Standard)", "Diseconomies Cost", "Capital Injection", "Ending Capital"]
 
-    # Build the two tables
-    fin_table = build_table(fin_summary_metrics, q_summary, y_summary)
-    kpi_table = build_table(kpi_metrics, q_kpis, y_kpis)
+for col in amount_cols:
+    df_display[col] = df[col].apply(lambda x: f"{currency_symbol}{format_currency(x, current_currency)}")
 
-    # Apply Formatting
-    def format_df(df_to_format):
-        formatted_df = df_to_format.copy().astype(object)  # Work on copy, ensure object type
-        for metric, row in df_to_format.iterrows():
-            for col_name, value in row.items():
-                if pd.isna(value):
-                    formatted_df.loc[metric, col_name] = 'N/A'
-                    continue
-                if '%' in metric or 'Change' in col_name:
-                    formatted_df.loc[metric, col_name] = format_percentage(value)
-                elif 'Unit' in metric:
-                    formatted_df.loc[metric, col_name] = format_currency(value, currency, use_units=False)
-                elif 'Units' in metric:
-                    formatted_df.loc[metric, col_name] = format_units(value)
-                else:  # Assume currency
-                    formatted_df.loc[metric, col_name] = format_currency(value, currency)
-        return formatted_df
+df_display["Units Produced"] = df["Units Produced"].apply(format_units)
+df_display["Profit Margin (%)"] = df["Profit Margin (%)"].apply(lambda x: f"{x:.2f}%")
 
-    return format_df(fin_table), format_df(kpi_table)
+# Select columns to display (including the standard profit for info)
+display_cols = ["Month", "Starting Capital", "Fixed Costs", "Remaining for Prod.",
+                "Units Produced", "Revenue", "Profit Margin (%)", "Profit (JS Logic)", "Profit (Standard)",
+                "Diseconomies Cost", "Capital Injection", "Ending Capital"]
+st.dataframe(df_display[display_cols], hide_index=True) # Use st.dataframe for better interactivity
 
 
-# --- Chart Creation (using Streamlit's native charts) ---
-def create_charts(monthly_df, q_summary, q_kpis, currency):
-    charts = {}
-    divisor = INR_TO_USD if currency == 'USD' else 1.0
+# --- Display Chart ---
+st.header("Financial Projections Chart")
 
-    # 1. Monthly Trends Chart
-    if not monthly_df.empty:
-        chart_df_monthly = monthly_df[['Month', 'Revenue', 'Total Costs', 'Profit', 'Ending Capital']].copy()
-        for col in ['Revenue', 'Total Costs', 'Profit', 'Ending Capital']:
-            chart_df_monthly[col] /= divisor
-        chart_df_monthly = chart_df_monthly.set_index('Month')
-        charts['monthly'] = chart_df_monthly
+# Prepare data for chart (apply currency conversion if needed)
+chart_df = df.copy()
+if current_currency == 'USD':
+    for col in amount_cols:
+        chart_df[col] = chart_df[col] / INR_TO_USD
 
-    # 2. Quarterly Financial Summary Chart
-    if not q_summary.empty:
-        chart_df_q_summary = q_summary[['Revenue', 'Profit', 'Ending Capital']].copy()
-        for col in ['Revenue', 'Profit', 'Ending Capital']:
-            chart_df_q_summary[col] /= divisor
-        chart_df_q_summary.index.name = 'Quarter'
-        charts['q_summary'] = chart_df_q_summary
+fig = go.Figure()
 
-    # 3. Quarterly KPIs Chart (Percentages)
-    if not q_kpis.empty:
-        # Select only percentage KPIs that are usually plotted together
-        kpi_cols_to_plot = ['Revenue Growth Rate (%)', 'Profit Growth Rate (%)', 'Gross Profit Margin (%)', 'Net Profit Margin (%)']
-        # Filter out KPIs not present or completely NaN
-        valid_kpi_cols = [col for col in kpi_cols_to_plot if col in q_kpis.columns and not q_kpis[col].isnull().all()]
-        if valid_kpi_cols:
-            chart_df_q_kpis = q_kpis[valid_kpi_cols].copy()
-            chart_df_q_kpis.index.name = 'Quarter'
-            charts['q_kpis'] = chart_df_q_kpis
-        else:
-            charts['q_kpis'] = pd.DataFrame()  # Ensure empty df if no valid kpis
+# Add traces for key metrics
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Starting Capital"], mode='lines', name='Starting Capital'))
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Fixed Costs"], mode='lines', name='Fixed Costs'))
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Revenue"], mode='lines', name='Revenue'))
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Profit (JS Logic)"], mode='lines', name='Profit (JS Logic)', line=dict(dash='dot'))) # Use JS profit for main chart line as per original
+# fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Profit (Standard)"], mode='lines', name='Profit (Standard)', line=dict(dash='dash'))) # Optional: show standard profit too
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Diseconomies Cost"], mode='lines', name='Diseconomies Cost'))
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Capital Injection"], mode='lines', name='Capital Injection'))
+fig.add_trace(go.Scatter(x=chart_df["Month"], y=chart_df["Ending Capital"], mode='lines', name='Ending Capital', line=dict(width=3))) # Thicker line for emphasis
 
-    return charts
+# Update layout
+fig.update_layout(
+    title="Monthly Financial Trends",
+    xaxis_title="Month",
+    yaxis_title=f"Amount ({current_currency})",
+    legend_title="Metrics",
+    hovermode="x unified" # Improves tooltip display
+)
 
+st.plotly_chart(fig, use_container_width=True)
 
-# --- Streamlit UI ---
-st.title("📊 Financial Projection Tool")
-
-# --- Inputs ---
-with st.expander("Configuration Inputs", expanded=True):
-    st.sidebar.header("Currency")
-    currency_choice = st.sidebar.radio("Select Currency", ('INR (₹)', 'USD ($)'), key='currency')
-    selected_currency = 'USD' if currency_choice == 'USD ($)' else 'INR'
-
-    # Use a form to gather inputs and run calculations on submission
-    with st.form(key='projection_form'):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Core Inputs")
-            initial_capital = st.number_input("Initial Capital", min_value=0.0, value=200000.0, step=10000.0, format="%.0f")
-            fixed_costs = st.number_input("Initial Fixed Costs / Month", min_value=0.0, value=30000.0, step=1000.0, format="%.0f")
-            variable_cost_per_unit = st.number_input("Variable Cost Per Unit", min_value=0.0, value=13.0, step=0.5, format="%.2f")
-            selling_price_per_unit = st.number_input("Selling Price Per Unit", min_value=0.0, value=20.0, step=0.5, format="%.2f")
-            months = st.number_input("Number of Months", min_value=1, value=24, step=1)
-
-        with col2:
-            st.subheader("Growth & Scaling")
-            profit_growth_rate_pct = st.number_input("Unit Profit Growth Rate (% / Month)", value=0.0, step=0.1, format="%.1f")
-            fixed_cost_growth_rate_pct = st.number_input("Fixed Cost Growth Rate (% / Month)", value=1.0, step=0.1, format="%.1f")
-            fixed_cost_cap = st.number_input("Fixed Cost Cap / Month", min_value=0.0, value=1000000.0, step=10000.0, format="%.0f")
-            diseconomies_scale_pct = st.number_input("Diseconomies of Scale (% of Revenue)", min_value=0.0, value=0.5, step=0.1, format="%.2f")
-
-        st.subheader("Capital Injections (Optional)")
-        col3, col4 = st.columns(2)
-        with col3:
-            ci_months_str = st.text_input("Injection Months (comma-separated)", value="", placeholder="e.g., 6, 12, 18")
-        with col4:
-            ci_amounts_str = st.text_input("Injection Amounts (comma-separated)", value="", placeholder="e.g., 50000, 100000, 150000")
-
-        # Submit button for the form
-        submitted = st.form_submit_button("Generate Projections")
-
-# --- Processing and Display ---
-if submitted:
-    # Process inputs only when form is submitted
-    try:
-        ci_months = [int(m.strip()) for m in ci_months_str.split(',') if m.strip()] if ci_months_str else []
-        ci_amounts = [float(a.strip()) for a in ci_amounts_str.split(',') if a.strip()] if ci_amounts_str else []
-        if len(ci_months) != len(ci_amounts):
-            st.error("Number of capital injection months must match number of amounts.")
-            st.stop()  # Stop execution if lists don't match
-    except ValueError:
-        st.error("Please enter comma-separated numbers for capital injection months and amounts.")
-        st.stop()
-
-    input_params = {
-        'initial_capital': initial_capital,
-        'fixed_costs': fixed_costs,
-        'variable_cost_per_unit': variable_cost_per_unit,
-        'selling_price_per_unit': selling_price_per_unit,
-        'profit_growth_rate': profit_growth_rate_pct / 100.0,
-        'fixed_cost_growth_rate': fixed_cost_growth_rate_pct / 100.0,
-        'fixed_cost_cap': fixed_cost_cap,
-        'diseconomies_of_scale': diseconomies_scale_pct / 100.0,
-        'months': months,
-        'ci_months': ci_months,
-        'ci_amounts': ci_amounts
-    }
-
-    # --- Run Simulation & Aggregation ---
-    with st.spinner('Calculating projections...'):
-        monthly_results_df = run_simulation(input_params)
-        q_summary_raw, y_summary_raw, q_kpis_raw, y_kpis_raw = aggregate_and_calculate_kpis(monthly_results_df)
-
-        # Store results in session state to survive currency changes without recalculating
-        st.session_state['monthly_results'] = monthly_results_df
-        st.session_state['q_summary_raw'] = q_summary_raw
-        st.session_state['y_summary_raw'] = y_summary_raw
-        st.session_state['q_kpis_raw'] = q_kpis_raw
-        st.session_state['y_kpis_raw'] = y_kpis_raw
-        st.session_state['results_generated'] = True
-
-# --- Display Results (if generated) ---
-if st.session_state.get('results_generated', False):
-    # Retrieve data from session state
-    monthly_df = st.session_state['monthly_results']
-    q_summary_raw = st.session_state['q_summary_raw']
-    y_summary_raw = st.session_state['y_summary_raw']
-    q_kpis_raw = st.session_state['q_kpis_raw']
-    y_kpis_raw = st.session_state['y_kpis_raw']
-
-    # Apply formatting based on current currency choice
-    fin_summary_table_formatted, kpi_table_formatted = create_summary_table(
-        q_summary_raw, y_summary_raw, q_kpis_raw, y_kpis_raw, selected_currency
-    )
-
-    # Format monthly table
-    monthly_table_formatted = monthly_df.copy()
-    currency_cols = ['Starting Capital', 'Fixed Costs', 'Variable Costs', 'Diseconomies Cost', 'Total Costs', 'Revenue', 'Profit', 'Capital Injection', 'Ending Capital']
-    for col in currency_cols:
-        monthly_table_formatted[col] = monthly_table_formatted[col].apply(lambda x: format_currency(x, selected_currency))
-
-    # Display Tables
-    st.subheader("Monthly Results")
-    st.dataframe(monthly_table_formatted)
-
-    st.subheader("Financial Summary")
-    st.dataframe(fin_summary_table_formatted)
-
-    st.subheader("KPIs")
-    st.dataframe(kpi_table_formatted)
-
-    # Charts
-    charts = create_charts(monthly_df, q_summary_raw, q_kpis_raw, selected_currency)
-
-    st.subheader("Monthly Trends")
-    if 'monthly' in charts and not charts['monthly'].empty:
-        st.line_chart(charts['monthly'])
-
-    st.subheader("Quarterly Financial Summary")
-    if 'q_summary' in charts and not charts['q_summary'].empty:
-        st.bar_chart(charts['q_summary'])
-
-    st.subheader("Quarterly KPIs")
-    if 'q_kpis' in charts and not charts['q_kpis'].empty:
-        st.line_chart(charts['q_kpis'])
+# --- Optional: Display Raw Data ---
+# with st.expander("Show Raw Calculated Data (INR)"):
+#     st.dataframe(df)
