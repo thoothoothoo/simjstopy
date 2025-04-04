@@ -160,7 +160,7 @@ def aggregate_and_calculate_kpis(monthly_df):
         yearly_agg = df.groupby('Year').agg(agg_rules)
 
     # --- Calculate Financial Summary Metrics (Quarterly & Yearly) ---
-    def create_summary_table(q_summary, y_summary, q_kpis, y_kpis, currency):
+def create_summary_table(q_summary, y_summary, q_kpis, y_kpis, currency):
     # Define which metrics go where
     fin_summary_metrics = {
         'Revenue': 'Revenue', 'Operating Expenses': 'Total Costs', 'Net Profit': 'Profit',
@@ -176,7 +176,7 @@ def aggregate_and_calculate_kpis(monthly_df):
     }
 
     # Function to build one transposed table
-    def build_table(metrics_map, q_data, y_data):
+def build_table(metrics_map, q_data, y_data):
         q_cols = {f"Q{i}": q_data.loc[i] for i in q_data.index}
         y_cols = {}
         if not y_data.empty:
@@ -258,7 +258,7 @@ def aggregate_and_calculate_kpis(monthly_df):
     kpi_table = build_table(kpi_metrics, q_kpis, y_kpis)
 
     # Apply Formatting
-    def format_df(df_to_format):
+def format_df(df_to_format):
         formatted_df = df_to_format.copy().astype(object) # Work on copy, ensure object type
         for metric, row in df_to_format.iterrows():
             for col_name, value in row.items():
@@ -276,5 +276,4 @@ def aggregate_and_calculate_kpis(monthly_df):
                     formatted_df.loc[metric, col_name] = format_currency(value, currency)
         return formatted_df
 
-    return format_df(fin_table), format_df(kpi_table)
-
+return format_df(fin_table), format_df(kpi_table)
