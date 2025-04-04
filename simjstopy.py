@@ -277,3 +277,4 @@ def aggregate_and_calculate_kpis(monthly_df):
         return formatted_df
 
     return format_df(fin_table), format_df(kpi_table)
+
